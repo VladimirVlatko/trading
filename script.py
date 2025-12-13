@@ -602,6 +602,7 @@ def run_once():
 # ---------- RUNNER ---------- #
 
 if __name__ == "__main__":
+
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
             "✅ Momentum Filter bot is ONLINE on Railway.\n"
@@ -610,16 +611,25 @@ if __name__ == "__main__":
             "Security: responds only to TELEGRAM_CHAT_ID."
         )
 
+    # ⬇️ ОВА МОРА ДА ПОСТОИ
+    CMD_POLL_SECONDS = 5      # колку често проверува Telegram команди
+    SCAN_SECONDS = 300        # market scan (5 мин)
+    last_scan = 0             # иницијализација
+
     while True:
         try:
-            # First handle any manual commands
+            # 1️⃣ Брза проверка на команди (/report)
             handle_telegram_commands()
 
-            # Then run the background scan (push ALERT 3 if needed)
-            run_once()
+            # 2️⃣ Market scan на свој распоред
+            now = time.time()
+            if now - last_scan >= SCAN_SECONDS:
+                run_once()
+                last_scan = now
 
         except Exception as e:
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
 
-        time.sleep(SLEEP_SECONDS)
+        time.sleep(CMD_POLL_SECONDS)
+
