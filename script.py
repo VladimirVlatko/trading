@@ -1,14 +1,17 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v3.1 (ALERT-3 ONLY)
-- Detects potential momentum moments (UP / DOWN / MIX) using 15m trigger
-- Higher TFs (1h/4h) are CONTEXT only (trend/regime), not the direction driver
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v3.2 (ALERT-3 push + Manual /report)
+- Push: sends Telegram message ONLY when ALERT == 3 (trade-moment candidate)
+- Pull: you can DM the bot:
+    /report            -> instant full report for all symbols
+    /report ETHUSDT    -> instant report for one symbol
+    /status            -> bot status
 - NO trading signals (no buy/sell, no entries/exits, no targets)
-- Telegram notifications: ONLY when ALERT == 3 (trade-moment candidate)
-- Includes derivatives context: funding, basis, mark/index, OI + OI change
+- DIR is 15m-driven (UP/DOWN/MIX), HTFs are context
 - Anti-spam:
   * 15m candle gating (max 1 msg per symbol per 15m candle) unless alert upgrades
   * Cooldown for ALERT 3
 - ALERT 3 requires real 15m trigger strength (prevents HTF-only ALERT 3)
+- Security: only responds to commands from TELEGRAM_CHAT_ID
 """
 
 import os
@@ -38,20 +41,20 @@ RETURN_LOOKBACK_4H = 6    # ~24 hours on 4h
 ALERT2_SCORE = 5
 ALERT3_SCORE = 7
 
-# Trigger requirements for ALERT 3 (must be "real", not HTF-only)
+# Trigger requirements for ALERT 3
 ALERT3_MIN_TRIGGER_REASONS = 2
 
 # Direction (15m-driven) sensitivity
 DIR_MIX_BAND = 1  # if |up_trg - dn_trg| <= 1 -> MIX
 
-# Cooldown (seconds) — ONLY ALERT 3 will notify
+# Cooldown (seconds) — ONLY ALERT 3 will notify automatically
 COOLDOWN_ALERT3 = 90 * 60   # 90 min
 
 # Loop interval
 SLEEP_SECONDS = 300  # 5 minutes
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # MUST be numeric string, e.g. "123456789"
 
 # ============================================ #
 
@@ -59,6 +62,7 @@ _last_sent = {}           # key: (symbol, direction) -> timestamp
 _last_alert_level = {}    # key: (symbol, direction) -> last alert sent (0/2/3)
 _last_15m_candle = {}     # key: symbol -> last 15m open_time(ms) that produced a message
 _prev_oi = {}             # key: symbol -> last open interest
+_last_update_id = 0       # Telegram polling offset
 
 # ---------- NETWORK HELPERS ---------- #
 
@@ -86,12 +90,29 @@ def http_post_json(url, payload, timeout=10):
 
 # ---------- TELEGRAM ---------- #
 
-def send_telegram(message: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram(message: str, chat_id: str | None = None):
+    if not TELEGRAM_TOKEN:
+        return
+    target_chat = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
+    if not target_chat:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": target_chat, "text": message, "parse_mode": "Markdown"}
     http_post_json(url, payload, timeout=10)
+
+def telegram_get_updates(offset=None):
+    if not TELEGRAM_TOKEN:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    data = http_get_json(url, params=params, timeout=10)
+    return data.get("result", [])
+
+def is_allowed_chat(chat_id: str) -> bool:
+    # Only allow your configured chat id to request reports
+    return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
 # ---------- INDICATORS ---------- #
 
@@ -227,7 +248,12 @@ def compute_returns(tf_snaps):
     out = {}
     for tf, snap in tf_snaps.items():
         close = snap["close_series"]
-        lb = RETURN_LOOKBACK_15M if tf == "15m" else (RETURN_LOOKBACK_1H if tf == "1h" else RETURN_LOOKBACK_4H)
+        if tf == "15m":
+            lb = RETURN_LOOKBACK_15M
+        elif tf == "1h":
+            lb = RETURN_LOOKBACK_1H
+        else:
+            lb = RETURN_LOOKBACK_4H
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
 
@@ -395,10 +421,9 @@ def analyze_symbol(symbol):
         "oi_change_pct": oi_change_pct
     }
 
-# ---------- ANTI-SPAM / GATING ---------- #
+# ---------- ANTI-SPAM / GATING (ALERT 3 only) ---------- #
 
 def allowed_to_send(report):
-    # We only notify for ALERT 3, so assume report["alert"] == 3 here.
     symbol = report["symbol"]
     direction = report["direction"]
     alert = report["alert"]
@@ -411,14 +436,14 @@ def allowed_to_send(report):
     candle_ot = report["tf"]["15m"]["open_time"]
     last_candle_for_symbol = _last_15m_candle.get(symbol)
 
-    # Upgrade path (rare now, but keep it)
+    # Upgrade path
     if alert > last_level:
         return True
 
     if last_sent is not None and (now - last_sent) < COOLDOWN_ALERT3:
         return False
 
-    # Gate: only one message per 15m candle per symbol, unless upgrade
+    # Gate: only one message per 15m candle per symbol
     if last_candle_for_symbol is not None and candle_ot == last_candle_for_symbol:
         return False
 
@@ -444,22 +469,24 @@ def fmt_num(x, digits=2):
     except Exception:
         return "n/a"
 
-def build_message(active_reports):
+def build_message(reports, title="MOMENTUM FILTER REPORT"):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"🚨 *TRADE MOMENT CANDIDATE (ALERT 3)*\nUTC: `{ts}`\n"
-    msg += "_(Scanner only — not a signal. Send this to ChatGPT for deeper analysis.)_\n\n"
+    msg = f"📊 *{title}*\nUTC: `{ts}`\n"
+    msg += "_(Scanner only — not a signal. Use as input for analysis.)_\n\n"
 
-    for r in active_reports:
+    for r in reports:
         sym = r["symbol"]
+        alert = r["alert"]
         direction = r["direction"]
         total = r["total_score"]
         up_trg = r["up_trg"]
         dn_trg = r["dn_trg"]
+
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
 
         msg += (
-            f"*{sym}*  |  *ALERT 3*  |  *DIR (15m): {direction}*  |  "
+            f"*{sym}*  |  *ALERT {alert}*  |  *DIR (15m): {direction}*  |  "
             f"total `{total}` (ctx1h `{r['ctx_1h']}` + ctx4h `{r['ctx_4h']}` + trg `{max(up_trg, dn_trg)}`)\n"
             f"Triggers: UP `{up_trg}` / DOWN `{dn_trg}`\n"
         )
@@ -494,19 +521,72 @@ def build_message(active_reports):
 
     return msg.strip()
 
+# ---------- MANUAL COMMAND HANDLER ---------- #
+
+def handle_telegram_commands():
+    global _last_update_id
+
+    if not TELEGRAM_TOKEN:
+        return
+
+    updates = telegram_get_updates(offset=_last_update_id + 1 if _last_update_id else None)
+    if not updates:
+        return
+
+    for u in updates:
+        _last_update_id = max(_last_update_id, u.get("update_id", 0))
+
+        msg = u.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        text = (msg.get("text") or "").strip()
+
+        if not text:
+            continue
+
+        # Security: only respond to your configured chat
+        if TELEGRAM_CHAT_ID and not is_allowed_chat(chat_id):
+            continue
+
+        if text.startswith("/status"):
+            send_telegram("✅ Bot is running.\nCommands:\n/report\n/report ETHUSDT", chat_id=chat_id)
+            continue
+
+        if text.startswith("/report"):
+            parts = text.split()
+            try:
+                if len(parts) == 1:
+                    # /report -> all symbols
+                    reps = [analyze_symbol(s) for s in SYMBOLS]
+                    send_telegram(build_message(reps, title="MANUAL REPORT (ALL)"), chat_id=chat_id)
+                else:
+                    sym = parts[1].upper()
+                    if sym not in SYMBOLS:
+                        send_telegram(f"❗Unknown symbol: `{sym}`\nAllowed: {', '.join(SYMBOLS)}", chat_id=chat_id)
+                        continue
+                    r = analyze_symbol(sym)
+                    send_telegram(build_message([r], title=f"MANUAL REPORT ({sym})"), chat_id=chat_id)
+            except Exception as e:
+                send_telegram(f"❌ Manual report error:\n`{e}`", chat_id=chat_id)
+            continue
+
+        if text.startswith("/help"):
+            send_telegram("Commands:\n/status\n/report\n/report ETHUSDT", chat_id=chat_id)
+            continue
+
 # ---------- MAIN LOOP ---------- #
 
 def run_once():
+    # background scan
     reports = []
     for s in SYMBOLS:
         try:
             reports.append(analyze_symbol(s))
         except Exception as e:
-            # Keep error notifications (important)
             send_telegram(f"⚠️ *Symbol error* `{s}`\n`{e}`")
             continue
 
-    # Notify ONLY ALERT 3
+    # auto-notify ONLY ALERT 3
     active = []
     for r in reports:
         if r["alert"] >= 3 and allowed_to_send(r):
@@ -515,7 +595,7 @@ def run_once():
     if not active:
         return
 
-    send_telegram(build_message(active))
+    send_telegram(build_message(active, title="TRADE MOMENT CANDIDATE (ALERT 3)"))
     for r in active:
         mark_sent(r)
 
@@ -525,15 +605,21 @@ if __name__ == "__main__":
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
             "✅ Momentum Filter bot is ONLINE on Railway.\n"
-            "v3.1: Telegram NOTIFIES ONLY on ALERT 3 (trade-moment candidate).\n"
-            "DIR is 15m-driven (UP/DOWN/MIX), HTFs are context.\n"
-            "Anti-spam: 15m gating + ALERT3 cooldown."
+            "Auto-push: ONLY ALERT 3.\n"
+            "Manual pull: /report or /report ETHUSDT.\n"
+            "Security: responds only to TELEGRAM_CHAT_ID."
         )
 
     while True:
         try:
+            # First handle any manual commands
+            handle_telegram_commands()
+
+            # Then run the background scan (push ALERT 3 if needed)
             run_once()
+
         except Exception as e:
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
+
         time.sleep(SLEEP_SECONDS)
