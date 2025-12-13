@@ -1,13 +1,13 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — OPTIMIZED v3
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v3.1 (ALERT-3 ONLY)
 - Detects potential momentum moments (UP / DOWN / MIX) using 15m trigger
 - Higher TFs (1h/4h) are CONTEXT only (trend/regime), not the direction driver
 - NO trading signals (no buy/sell, no entries/exits, no targets)
-- Sends Telegram message ONLY if ALERT LEVEL >= 2
+- Telegram notifications: ONLY when ALERT == 3 (trade-moment candidate)
 - Includes derivatives context: funding, basis, mark/index, OI + OI change
 - Anti-spam:
   * 15m candle gating (max 1 msg per symbol per 15m candle) unless alert upgrades
-  * Cooldowns per alert level
+  * Cooldown for ALERT 3
 - ALERT 3 requires real 15m trigger strength (prevents HTF-only ALERT 3)
 """
 
@@ -44,8 +44,7 @@ ALERT3_MIN_TRIGGER_REASONS = 2
 # Direction (15m-driven) sensitivity
 DIR_MIX_BAND = 1  # if |up_trg - dn_trg| <= 1 -> MIX
 
-# Cooldowns (seconds) per symbol+direction
-COOLDOWN_ALERT2 = 45 * 60   # 45 min
+# Cooldown (seconds) — ONLY ALERT 3 will notify
 COOLDOWN_ALERT3 = 90 * 60   # 90 min
 
 # Loop interval
@@ -326,26 +325,22 @@ def analyze_symbol(symbol):
     oi_change_pct = pct_change(deriv["oi"], prev_oi) if prev_oi and prev_oi > 0 else None
     _prev_oi[symbol] = deriv["oi"]
 
-    # 15m triggers (direction driver)
     up_trg, up_trg_r = trigger_score_15m(tf_snaps["15m"], "UP", ret_15m)
     dn_trg, dn_trg_r = trigger_score_15m(tf_snaps["15m"], "DOWN", ret_15m)
     direction = choose_direction_from_15m(up_trg, dn_trg)
 
-    # Context (1h/4h) scored to the chosen direction; MIX uses best of both
+    # Context scoring
     if direction == "UP":
         ctx_1h, ctx_1h_r = regime_score(tf_snaps["1h"], "UP")
         ctx_4h, ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
         trg_score, trg_reasons = up_trg, up_trg_r
-        up_score, dn_score = up_trg, dn_trg
         ctx_dir = "UP"
     elif direction == "DOWN":
         ctx_1h, ctx_1h_r = regime_score(tf_snaps["1h"], "DOWN")
         ctx_4h, ctx_4h_r = regime_score(tf_snaps["4h"], "DOWN")
         trg_score, trg_reasons = dn_trg, dn_trg_r
-        up_score, dn_score = up_trg, dn_trg
         ctx_dir = "DOWN"
     else:
-        # MIX: score context as the max support (but keep transparent)
         up_ctx_1h, up_ctx_1h_r = regime_score(tf_snaps["1h"], "UP")
         up_ctx_4h, up_ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
         dn_ctx_1h, dn_ctx_1h_r = regime_score(tf_snaps["1h"], "DOWN")
@@ -362,9 +357,7 @@ def analyze_symbol(symbol):
 
         trg_score = max(up_trg, dn_trg)
         trg_reasons = up_trg_r if up_trg >= dn_trg else dn_trg_r
-        up_score, dn_score = up_trg, dn_trg
 
-    # Total score drives ALERT level (context + trigger)
     total_score = ctx_1h + ctx_4h + trg_score
 
     alert = 0
@@ -373,15 +366,12 @@ def analyze_symbol(symbol):
     if total_score >= ALERT3_SCORE:
         alert = 3
 
-    # Prevent HTF-only ALERT 3
     if alert == 3 and len(trg_reasons) < ALERT3_MIN_TRIGGER_REASONS:
         alert = 2
 
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
-
     tf_public = {k: {kk: vv for kk, vv in v.items() if kk != "close_series"} for k, v in tf_snaps.items()}
 
-    # Reasons
     reasons = []
     reasons += [f"Context scored as: {ctx_dir}"]
     reasons += ["Setup (1h):"] + (ctx_1h_r if ctx_1h_r else ["(neutral)"])
@@ -391,7 +381,7 @@ def analyze_symbol(symbol):
     return {
         "symbol": symbol,
         "alert": alert,
-        "direction": direction,      # UP / DOWN / MIX (15m-driven)
+        "direction": direction,
         "total_score": total_score,
         "up_trg": up_trg,
         "dn_trg": dn_trg,
@@ -408,6 +398,7 @@ def analyze_symbol(symbol):
 # ---------- ANTI-SPAM / GATING ---------- #
 
 def allowed_to_send(report):
+    # We only notify for ALERT 3, so assume report["alert"] == 3 here.
     symbol = report["symbol"]
     direction = report["direction"]
     alert = report["alert"]
@@ -420,12 +411,11 @@ def allowed_to_send(report):
     candle_ot = report["tf"]["15m"]["open_time"]
     last_candle_for_symbol = _last_15m_candle.get(symbol)
 
-    # If alert upgraded, send immediately
+    # Upgrade path (rare now, but keep it)
     if alert > last_level:
         return True
 
-    cooldown = COOLDOWN_ALERT3 if alert >= 3 else COOLDOWN_ALERT2
-    if last_sent is not None and (now - last_sent) < cooldown:
+    if last_sent is not None and (now - last_sent) < COOLDOWN_ALERT3:
         return False
 
     # Gate: only one message per 15m candle per symbol, unless upgrade
@@ -456,24 +446,20 @@ def fmt_num(x, digits=2):
 
 def build_message(active_reports):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"🔔 *MOMENTUM FILTER ALERT*\nUTC: `{ts}`\n"
-    msg += "_(Scanner only — no trade signals. Use as input for analysis.)_\n\n"
+    msg = f"🚨 *TRADE MOMENT CANDIDATE (ALERT 3)*\nUTC: `{ts}`\n"
+    msg += "_(Scanner only — not a signal. Send this to ChatGPT for deeper analysis.)_\n\n"
 
     for r in active_reports:
         sym = r["symbol"]
-        alert = r["alert"]
         direction = r["direction"]
-
         total = r["total_score"]
         up_trg = r["up_trg"]
         dn_trg = r["dn_trg"]
-
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
 
-        # Header with transparency: 15m triggers + context score
         msg += (
-            f"*{sym}*  |  *ALERT {alert}*  |  *DIR (15m): {direction}*  |  "
+            f"*{sym}*  |  *ALERT 3*  |  *DIR (15m): {direction}*  |  "
             f"total `{total}` (ctx1h `{r['ctx_1h']}` + ctx4h `{r['ctx_4h']}` + trg `{max(up_trg, dn_trg)}`)\n"
             f"Triggers: UP `{up_trg}` / DOWN `{dn_trg}`\n"
         )
@@ -487,7 +473,6 @@ def build_message(active_reports):
             msg += f" | OIΔ `{fmt_num(oi_chg, 2)}%`"
         msg += "\n"
 
-        # TF blocks
         for tf in ["4h", "1h", "15m"]:
             t = r["tf"][tf]
             lbl = r["trend_labels"][tf]
@@ -517,12 +502,14 @@ def run_once():
         try:
             reports.append(analyze_symbol(s))
         except Exception as e:
+            # Keep error notifications (important)
             send_telegram(f"⚠️ *Symbol error* `{s}`\n`{e}`")
             continue
 
+    # Notify ONLY ALERT 3
     active = []
     for r in reports:
-        if r["alert"] >= 2 and allowed_to_send(r):
+        if r["alert"] >= 3 and allowed_to_send(r):
             active.append(r)
 
     if not active:
@@ -538,8 +525,9 @@ if __name__ == "__main__":
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
             "✅ Momentum Filter bot is ONLINE on Railway.\n"
-            "v3: DIR is 15m-driven (UP/DOWN/MIX), HTFs are context.\n"
-            "Anti-spam: 15m candle gating + cooldowns; ALERT3 needs real 15m trigger."
+            "v3.1: Telegram NOTIFIES ONLY on ALERT 3 (trade-moment candidate).\n"
+            "DIR is 15m-driven (UP/DOWN/MIX), HTFs are context.\n"
+            "Anti-spam: 15m gating + ALERT3 cooldown."
         )
 
     while True:
