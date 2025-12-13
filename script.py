@@ -1,15 +1,14 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — OPTIMIZED
-- Detects potential momentum moments (UP / DOWN) across 15m/1h/4h
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — OPTIMIZED v3
+- Detects potential momentum moments (UP / DOWN / MIX) using 15m trigger
+- Higher TFs (1h/4h) are CONTEXT only (trend/regime), not the direction driver
 - NO trading signals (no buy/sell, no entries/exits, no targets)
-- Designed as a "momentum scanner + snapshot" for human + ChatGPT analysis
 - Sends Telegram message ONLY if ALERT LEVEL >= 2
 - Includes derivatives context: funding, basis, mark/index, OI + OI change
-- Optimizations:
-  * Anti-spam: 15m candle gating (max 1 msg per symbol per 15m candle) unless alert upgrades
+- Anti-spam:
+  * 15m candle gating (max 1 msg per symbol per 15m candle) unless alert upgrades
   * Cooldowns per alert level
-  * Alert 3 requires real 15m trigger (prevents "HTF-only" ALERT 3)
-  * Cleaner reasons (no duplication)
+- ALERT 3 requires real 15m trigger strength (prevents HTF-only ALERT 3)
 """
 
 import os
@@ -30,21 +29,24 @@ RSI_LEN = 14
 ATR_LEN = 14
 
 VOL_LOOKBACK = 20
-SLOPE_LOOKBACK = 6  # slope vs last N candles
+SLOPE_LOOKBACK = 6
 RETURN_LOOKBACK_15M = 6   # ~90 mins on 15m
 RETURN_LOOKBACK_1H = 6    # ~6 hours on 1h
 RETURN_LOOKBACK_4H = 6    # ~24 hours on 4h
 
-# Alert thresholds
+# Alert thresholds (total = HTF context + 15m trigger)
 ALERT2_SCORE = 5
 ALERT3_SCORE = 7
 
 # Trigger requirements for ALERT 3 (must be "real", not HTF-only)
 ALERT3_MIN_TRIGGER_REASONS = 2
 
+# Direction (15m-driven) sensitivity
+DIR_MIX_BAND = 1  # if |up_trg - dn_trg| <= 1 -> MIX
+
 # Cooldowns (seconds) per symbol+direction
-COOLDOWN_ALERT2 = 45 * 60   # 45 min (heads-up)
-COOLDOWN_ALERT3 = 90 * 60   # 90 min (strong)
+COOLDOWN_ALERT2 = 45 * 60   # 45 min
+COOLDOWN_ALERT3 = 90 * 60   # 90 min
 
 # Loop interval
 SLEEP_SECONDS = 300  # 5 minutes
@@ -54,7 +56,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ============================================ #
 
-# In-memory state (persists while process runs)
 _last_sent = {}           # key: (symbol, direction) -> timestamp
 _last_alert_level = {}    # key: (symbol, direction) -> last alert sent (0/2/3)
 _last_15m_candle = {}     # key: symbol -> last 15m open_time(ms) that produced a message
@@ -90,11 +91,7 @@ def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     http_post_json(url, payload, timeout=10)
 
 # ---------- INDICATORS ---------- #
@@ -170,34 +167,20 @@ def fetch_klines(symbol, interval, limit=180):
     return np.array(data, dtype=float)
 
 def fetch_derivatives(symbol):
-    mark = http_get_json(
-        f"{BINANCE_FUTURES}/fapi/v1/premiumIndex",
-        params={"symbol": symbol},
-        timeout=10
-    )
-    oi = http_get_json(
-        f"{BINANCE_FUTURES}/fapi/v1/openInterest",
-        params={"symbol": symbol},
-        timeout=10
-    )
+    mark = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
+    oi = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=10)
+
     mark_price = float(mark["markPrice"])
     index_price = float(mark["indexPrice"])
     funding_pct = float(mark["lastFundingRate"]) * 100.0
     basis_pct = (mark_price - index_price) / (index_price + 1e-12) * 100.0
     oi_val = float(oi["openInterest"])
 
-    return {
-        "mark": mark_price,
-        "index": index_price,
-        "funding": funding_pct,
-        "basis": basis_pct,
-        "oi": oi_val
-    }
+    return {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
 
 # ---------- SNAPSHOT ---------- #
 
 def tf_snapshot(k, tf_name):
-    # k columns: [open_time, open, high, low, close, volume, ...]
     close = k[:, 4]
     high = k[:, 2]
     low = k[:, 3]
@@ -214,8 +197,7 @@ def tf_snapshot(k, tf_name):
     rsi_slp = rsi_v[-1] - rsi_v[-1 - sl_n] if len(rsi_v) > sl_n else 0.0
 
     vol_ratio = vol[-1] / (np.mean(vol[-VOL_LOOKBACK:]) + 1e-12) if len(vol) >= VOL_LOOKBACK else 1.0
-
-    open_time = int(k[-1, 0])  # ms, last candle open time
+    open_time = int(k[-1, 0])  # ms
 
     return {
         "tf": tf_name,
@@ -232,19 +214,29 @@ def tf_snapshot(k, tf_name):
         "close_series": close
     }
 
-# ---------- MOMENTUM SCORING ---------- #
+# ---------- LABELS / RETURNS ---------- #
+
+def tf_trend_label(snap):
+    price, e20, e50 = snap["price"], snap["ema20"], snap["ema50"]
+    if price > e20 and e20 > e50:
+        return "UP"
+    if price < e20 and e20 < e50:
+        return "DOWN"
+    return "MIX"
+
+def compute_returns(tf_snaps):
+    out = {}
+    for tf, snap in tf_snaps.items():
+        close = snap["close_series"]
+        lb = RETURN_LOOKBACK_15M if tf == "15m" else (RETURN_LOOKBACK_1H if tf == "1h" else RETURN_LOOKBACK_4H)
+        out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
+    return out
+
+# ---------- CONTEXT (HTF) ---------- #
 
 def regime_score(tf_snap, direction):
-    """
-    Higher timeframe regime: trend/structure alignment (1h, 4h)
-    direction = "UP" or "DOWN"
-    """
-    price = tf_snap["price"]
-    e20 = tf_snap["ema20"]
-    e50 = tf_snap["ema50"]
-    e20_slp = tf_snap["ema20_slp"]
-    e50_slp = tf_snap["ema50_slp"]
-    rsi = tf_snap["rsi"]
+    price, e20, e50 = tf_snap["price"], tf_snap["ema20"], tf_snap["ema50"]
+    e20_slp, e50_slp, rsi = tf_snap["ema20_slp"], tf_snap["ema50_slp"], tf_snap["rsi"]
 
     score = 0
     reasons = []
@@ -270,17 +262,11 @@ def regime_score(tf_snap, direction):
 
     return score, reasons
 
+# ---------- 15m TRIGGER (direction driver) ---------- #
+
 def trigger_score_15m(tf15, direction, ret_15m):
-    """
-    15m trigger: momentum impulse characteristics (must exist for ALERT 3)
-    Uses ret_15m as extra confirmation to reduce HTF-only false ALERT 3.
-    """
-    price = tf15["price"]
-    e20 = tf15["ema20"]
-    e50 = tf15["ema50"]
-    rsi = tf15["rsi"]
-    rsi_slp = tf15["rsi_slp"]
-    vol_ratio = tf15["vol_ratio"]
+    price, e20, e50 = tf15["price"], tf15["ema20"], tf15["ema50"]
+    rsi, rsi_slp, vol_ratio = tf15["rsi"], tf15["rsi_slp"], tf15["vol_ratio"]
 
     score = 0
     reasons = []
@@ -318,34 +304,15 @@ def trigger_score_15m(tf15, direction, ret_15m):
 
     return score, reasons
 
-def compute_returns(tf_snaps):
-    out = {}
-    for tf, snap in tf_snaps.items():
-        close = snap["close_series"]
-        if tf == "15m":
-            lb = RETURN_LOOKBACK_15M
-        elif tf == "1h":
-            lb = RETURN_LOOKBACK_1H
-        else:
-            lb = RETURN_LOOKBACK_4H
-
-        out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
-    return out
-
-def tf_trend_label(snap):
-    price = snap["price"]
-    e20 = snap["ema20"]
-    e50 = snap["ema50"]
-    if price > e20 and e20 > e50:
-        return "UP"
-    if price < e20 and e20 < e50:
-        return "DOWN"
-    return "MIX"
+def choose_direction_from_15m(up_trg, dn_trg):
+    diff = up_trg - dn_trg
+    if abs(diff) <= DIR_MIX_BAND:
+        return "MIX"
+    return "UP" if diff > 0 else "DOWN"
 
 # ---------- ANALYSIS ---------- #
 
 def analyze_symbol(symbol):
-    # Fetch klines and snapshots
     tf_snaps = {}
     for tf, interval in TIMEFRAMES.items():
         k = fetch_klines(symbol, interval, limit=180)
@@ -354,66 +321,82 @@ def analyze_symbol(symbol):
     returns = compute_returns(tf_snaps)
     ret_15m = returns["15m"]
 
-    # Derivatives
     deriv = fetch_derivatives(symbol)
     prev_oi = _prev_oi.get(symbol)
     oi_change_pct = pct_change(deriv["oi"], prev_oi) if prev_oi and prev_oi > 0 else None
     _prev_oi[symbol] = deriv["oi"]
 
-    # Scores for both directions
-    up_reg_1h, up_reg_1h_r = regime_score(tf_snaps["1h"], "UP")
-    up_reg_4h, up_reg_4h_r = regime_score(tf_snaps["4h"], "UP")
-    dn_reg_1h, dn_reg_1h_r = regime_score(tf_snaps["1h"], "DOWN")
-    dn_reg_4h, dn_reg_4h_r = regime_score(tf_snaps["4h"], "DOWN")
-
+    # 15m triggers (direction driver)
     up_trg, up_trg_r = trigger_score_15m(tf_snaps["15m"], "UP", ret_15m)
     dn_trg, dn_trg_r = trigger_score_15m(tf_snaps["15m"], "DOWN", ret_15m)
+    direction = choose_direction_from_15m(up_trg, dn_trg)
 
-    up_score = up_reg_1h + up_reg_4h + up_trg
-    dn_score = dn_reg_1h + dn_reg_4h + dn_trg
-
-    direction = "UP" if up_score >= dn_score else "DOWN"
-    best_score = max(up_score, dn_score)
-
-    # Selected reasons
+    # Context (1h/4h) scored to the chosen direction; MIX uses best of both
     if direction == "UP":
-        setup_reasons = ["Setup (1h):"] + up_reg_1h_r + ["Setup (4h):"] + up_reg_4h_r
-        trigger_reasons = up_trg_r
-        scores = {"best_score": best_score, "up_score": up_score, "dn_score": dn_score}
+        ctx_1h, ctx_1h_r = regime_score(tf_snaps["1h"], "UP")
+        ctx_4h, ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
+        trg_score, trg_reasons = up_trg, up_trg_r
+        up_score, dn_score = up_trg, dn_trg
+        ctx_dir = "UP"
+    elif direction == "DOWN":
+        ctx_1h, ctx_1h_r = regime_score(tf_snaps["1h"], "DOWN")
+        ctx_4h, ctx_4h_r = regime_score(tf_snaps["4h"], "DOWN")
+        trg_score, trg_reasons = dn_trg, dn_trg_r
+        up_score, dn_score = up_trg, dn_trg
+        ctx_dir = "DOWN"
     else:
-        setup_reasons = ["Setup (1h):"] + dn_reg_1h_r + ["Setup (4h):"] + dn_reg_4h_r
-        trigger_reasons = dn_trg_r
-        scores = {"best_score": best_score, "up_score": up_score, "dn_score": dn_score}
+        # MIX: score context as the max support (but keep transparent)
+        up_ctx_1h, up_ctx_1h_r = regime_score(tf_snaps["1h"], "UP")
+        up_ctx_4h, up_ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
+        dn_ctx_1h, dn_ctx_1h_r = regime_score(tf_snaps["1h"], "DOWN")
+        dn_ctx_4h, dn_ctx_4h_r = regime_score(tf_snaps["4h"], "DOWN")
 
-    # Alert level
+        if (up_ctx_1h + up_ctx_4h) >= (dn_ctx_1h + dn_ctx_4h):
+            ctx_1h, ctx_1h_r = up_ctx_1h, up_ctx_1h_r
+            ctx_4h, ctx_4h_r = up_ctx_4h, up_ctx_4h_r
+            ctx_dir = "UP-ish"
+        else:
+            ctx_1h, ctx_1h_r = dn_ctx_1h, dn_ctx_1h_r
+            ctx_4h, ctx_4h_r = dn_ctx_4h, dn_ctx_4h_r
+            ctx_dir = "DOWN-ish"
+
+        trg_score = max(up_trg, dn_trg)
+        trg_reasons = up_trg_r if up_trg >= dn_trg else dn_trg_r
+        up_score, dn_score = up_trg, dn_trg
+
+    # Total score drives ALERT level (context + trigger)
+    total_score = ctx_1h + ctx_4h + trg_score
+
     alert = 0
-    if best_score >= ALERT2_SCORE:
+    if total_score >= ALERT2_SCORE:
         alert = 2
-    if best_score >= ALERT3_SCORE:
+    if total_score >= ALERT3_SCORE:
         alert = 3
 
-    # Prevent HTF-only ALERT 3 (must have real 15m trigger)
-    if alert == 3 and len(trigger_reasons) < ALERT3_MIN_TRIGGER_REASONS:
+    # Prevent HTF-only ALERT 3
+    if alert == 3 and len(trg_reasons) < ALERT3_MIN_TRIGGER_REASONS:
         alert = 2
 
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
 
-    # Strip close_series before returning
     tf_public = {k: {kk: vv for kk, vv in v.items() if kk != "close_series"} for k, v in tf_snaps.items()}
 
-    # Build compact reasons (no empty Trigger)
+    # Reasons
     reasons = []
-    reasons += setup_reasons
-    reasons += ["Trigger (15m):"]
-    reasons += trigger_reasons if trigger_reasons else ["(no strong 15m trigger yet)"]
+    reasons += [f"Context scored as: {ctx_dir}"]
+    reasons += ["Setup (1h):"] + (ctx_1h_r if ctx_1h_r else ["(neutral)"])
+    reasons += ["Setup (4h):"] + (ctx_4h_r if ctx_4h_r else ["(neutral)"])
+    reasons += ["Trigger (15m):"] + (trg_reasons if trg_reasons else ["(no strong 15m trigger yet)"])
 
     return {
         "symbol": symbol,
         "alert": alert,
-        "direction": direction,
-        "best_score": scores["best_score"],
-        "up_score": scores["up_score"],
-        "dn_score": scores["dn_score"],
+        "direction": direction,      # UP / DOWN / MIX (15m-driven)
+        "total_score": total_score,
+        "up_trg": up_trg,
+        "dn_trg": dn_trg,
+        "ctx_1h": ctx_1h,
+        "ctx_4h": ctx_4h,
         "reasons": reasons,
         "tf": tf_public,
         "returns": returns,
@@ -434,19 +417,18 @@ def allowed_to_send(report):
     last_sent = _last_sent.get(key)
     last_level = _last_alert_level.get(key, 0)
 
-    candle_ot = report["tf"]["15m"]["open_time"]  # ms
+    candle_ot = report["tf"]["15m"]["open_time"]
     last_candle_for_symbol = _last_15m_candle.get(symbol)
 
-    # Upgrade path: if alert increased (e.g., 2 -> 3), send immediately
+    # If alert upgraded, send immediately
     if alert > last_level:
         return True
 
-    # Apply cooldown
     cooldown = COOLDOWN_ALERT3 if alert >= 3 else COOLDOWN_ALERT2
     if last_sent is not None and (now - last_sent) < cooldown:
         return False
 
-    # Gate: only one message per new 15m candle (per symbol), unless upgrade
+    # Gate: only one message per 15m candle per symbol, unless upgrade
     if last_candle_for_symbol is not None and candle_ot == last_candle_for_symbol:
         return False
 
@@ -481,14 +463,21 @@ def build_message(active_reports):
         sym = r["symbol"]
         alert = r["alert"]
         direction = r["direction"]
-        score = r["best_score"]
-        up_score = r["up_score"]
-        dn_score = r["dn_score"]
+
+        total = r["total_score"]
+        up_trg = r["up_trg"]
+        dn_trg = r["dn_trg"]
 
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
 
-        msg += f"*{sym}*  |  *ALERT {alert}*  |  *DIR: {direction}*  |  score: `{score}` (UP `{up_score}` / DOWN `{dn_score}`)\n"
+        # Header with transparency: 15m triggers + context score
+        msg += (
+            f"*{sym}*  |  *ALERT {alert}*  |  *DIR (15m): {direction}*  |  "
+            f"total `{total}` (ctx1h `{r['ctx_1h']}` + ctx4h `{r['ctx_4h']}` + trg `{max(up_trg, dn_trg)}`)\n"
+            f"Triggers: UP `{up_trg}` / DOWN `{dn_trg}`\n"
+        )
+
         msg += (
             f"Deriv: mark `{fmt_num(deriv['mark'], 2)}` | index `{fmt_num(deriv['index'], 2)}` | "
             f"funding `{fmt_num(deriv['funding'], 4)}%` | basis `{fmt_num(deriv['basis'], 4)}%` | "
@@ -498,6 +487,7 @@ def build_message(active_reports):
             msg += f" | OIΔ `{fmt_num(oi_chg, 2)}%`"
         msg += "\n"
 
+        # TF blocks
         for tf in ["4h", "1h", "15m"]:
             t = r["tf"][tf]
             lbl = r["trend_labels"][tf]
@@ -513,7 +503,7 @@ def build_message(active_reports):
             )
 
         msg += "Why flagged:\n"
-        for line in r["reasons"][:14]:
+        for line in r["reasons"][:16]:
             msg += f"• {line}\n"
         msg += "\n"
 
@@ -538,9 +528,7 @@ def run_once():
     if not active:
         return
 
-    msg = build_message(active)
-    send_telegram(msg)
-
+    send_telegram(build_message(active))
     for r in active:
         mark_sent(r)
 
@@ -550,8 +538,8 @@ if __name__ == "__main__":
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
             "✅ Momentum Filter bot is ONLINE on Railway.\n"
-            "Vars OK. Scanning 15m/1h/4h for UP/DOWN momentum candidates.\n"
-            "Optimized: 15m candle gating + cooldowns + ALERT3 needs real 15m trigger."
+            "v3: DIR is 15m-driven (UP/DOWN/MIX), HTFs are context.\n"
+            "Anti-spam: 15m candle gating + cooldowns; ALERT3 needs real 15m trigger."
         )
 
     while True:
