@@ -181,6 +181,14 @@ def run():
 # ---------- RUNNER ---------- #
 
 if __name__ == "__main__":
+    # Startup ping (се праќа само еднаш кога ќе се крене bot-от)
+    send_telegram("✅ Momentum bot is ONLINE on Railway.\nVariables OK. Waiting for signals.")
+
     while True:
-        run()
+        try:
+            run()
+        except Exception as e:
+            send_telegram(f"❌ Runtime error:\n{e}")
         time.sleep(300)  # 5 minutes
+
+
