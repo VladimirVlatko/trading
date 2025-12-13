@@ -3,6 +3,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "script.py"
+    "startCommand": "python script.py"
   }
 }
+
