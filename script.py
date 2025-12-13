@@ -1,5 +1,5 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.0 (FINAL)
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.1 (FINAL)
 GOAL:
 - Bot runs continuously, BUT notifies you ONLY when there is a REAL momentum moment.
 - No trade signals. Scanner only (input for deeper analysis).
@@ -9,16 +9,20 @@ AUTO PUSH (Telegram):
 - ALERT 3 is ONLY allowed when:
   1) 15m direction is clear (UP or DOWN)  -> NO MIX for alert 3
   2) 15m trigger score is strong         -> MIN_TRIGGER_SCORE_FOR_ALERT3
-  3) at least MIN_TRIGGER_REASONS_FOR_ALERT3 are present (sanity filter)
+  3) at least MIN_TRIGGER_REASONS_FOR_ALERT3 are present
+
+AUTO PUSH payload (for analysis):
+- Sends FULL report per triggered symbol (safe vs Telegram 4096 limit)
+- Then sends COMPACT context for the other symbols
 
 MANUAL PULL (Telegram commands):
-- /report            -> instant report for all symbols (shows alert status too)
-- /report ETHUSDT    -> instant report for one symbol
+- /report            -> report for all symbols
+- /report ETHUSDT    -> report for one symbol
 - /status            -> bot status
 
 Timing:
 - Commands polled every CMD_POLL_SECONDS (fast)
-- Market scan runs every SCAN_SECONDS (5 min; aligned with 15m candles)
+- Market scan runs every SCAN_SECONDS (5 min)
 """
 
 import os
@@ -45,33 +49,33 @@ RETURN_LOOKBACK_15M = 6   # ~90 mins
 RETURN_LOOKBACK_1H = 6    # ~6 hours
 RETURN_LOOKBACK_4H = 6    # ~24 hours
 
-# Context + Trigger scoring thresholds
 ALERT2_SCORE = 5
 ALERT3_SCORE = 7
 
-# ✅ HARD rules to ensure ALERT 3 means "REAL MOMENTUM NOW"
-MIN_TRIGGER_SCORE_FOR_ALERT3 = 4         # strong 15m trigger required
-MIN_TRIGGER_REASONS_FOR_ALERT3 = 2       # must have at least 2 trigger reasons
-BLOCK_ALERT3_IF_DIR_MIX = True           # ALERT 3 cannot be MIX direction
+# HARD rules: ALERT 3 == "REAL momentum NOW"
+MIN_TRIGGER_SCORE_FOR_ALERT3 = 4
+MIN_TRIGGER_REASONS_FOR_ALERT3 = 2
+BLOCK_ALERT3_IF_DIR_MIX = True
 
-# Anti-spam for auto ALERT 3
+# Anti-spam
 COOLDOWN_ALERT3 = 90 * 60   # 90 minutes
 DIR_MIX_BAND = 1            # if |up_trg - dn_trg| <= 1 -> MIX
 
 # Scheduling
-CMD_POLL_SECONDS = 5        # fast manual /report
-SCAN_SECONDS = 300          # market scan cadence (5 min)
+CMD_POLL_SECONDS = 5
+SCAN_SECONDS = 300
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # numeric string
 
 # ============================================ #
 
-_last_sent = {}           # key: (symbol, direction) -> timestamp
-_last_alert_level = {}    # key: (symbol, direction) -> last alert sent
-_last_15m_candle = {}     # key: symbol -> last 15m open_time(ms) that produced an AUTO message
-_prev_oi = {}             # key: symbol -> last open interest
+_last_sent = {}           # (symbol, direction) -> timestamp
+_last_alert_level = {}    # (symbol, direction) -> last alert sent
+_last_15m_candle = {}     # symbol -> last 15m open_time(ms) that produced an AUTO message
+_prev_oi = {}             # symbol -> last open interest
 _last_update_id = 0       # Telegram polling offset
+
 
 # ---------- NETWORK HELPERS ---------- #
 
@@ -91,11 +95,15 @@ def http_post_json(url, payload, timeout=10):
         try:
             r = requests.post(url, json=payload, timeout=timeout)
             r.raise_for_status()
-            return r.json()
+            try:
+                return r.json()
+            except Exception:
+                return {"ok": True, "raw": r.text[:200]}
         except Exception:
             if attempt == 1:
                 raise
             time.sleep(0.5)
+
 
 # ---------- TELEGRAM ---------- #
 
@@ -105,12 +113,16 @@ def send_telegram(message: str, chat_id: str | None = None):
     target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
     if not target:
         return
+
+    # Telegram limit safety (Markdown + headroom)
+    if message and len(message) > 3900:
+        message = message[:3900] + "\n…(truncated)"
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": target, "text": message, "parse_mode": "Markdown"}
     http_post_json(url, payload, timeout=10)
 
 def telegram_delete_webhook():
-    # ensures getUpdates works even if a webhook was set in the past
     if not TELEGRAM_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook"
@@ -127,8 +139,8 @@ def telegram_get_updates(offset=None, timeout=0):
     return data.get("result", [])
 
 def is_allowed_chat(chat_id: str) -> bool:
-    # respond only in your configured chat
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
 
 # ---------- INDICATORS ---------- #
 
@@ -194,6 +206,7 @@ def atr_wilder(high, low, close, length=14):
 def pct_change(a, b):
     return ((a - b) / (b + 1e-12)) * 100.0
 
+
 # ---------- DATA ---------- #
 
 def fetch_klines(symbol, interval, limit=180):
@@ -213,6 +226,7 @@ def fetch_derivatives(symbol):
     oi_val = float(oi["openInterest"])
 
     return {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
+
 
 # ---------- SNAPSHOT ---------- #
 
@@ -250,6 +264,7 @@ def tf_snapshot(k, tf_name):
         "close_series": close
     }
 
+
 # ---------- LABELS / RETURNS ---------- #
 
 def tf_trend_label(snap):
@@ -272,6 +287,7 @@ def compute_returns(tf_snaps):
             lb = RETURN_LOOKBACK_4H
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
+
 
 # ---------- CONTEXT (HTF) ---------- #
 
@@ -302,6 +318,7 @@ def regime_score(tf_snap, direction):
             score += 1; reasons.append("HTF RSI weak")
 
     return score, reasons
+
 
 # ---------- 15m TRIGGER (direction driver) ---------- #
 
@@ -351,6 +368,7 @@ def choose_direction_from_15m(up_trg, dn_trg):
         return "MIX"
     return "UP" if diff > 0 else "DOWN"
 
+
 # ---------- ANALYSIS ---------- #
 
 def analyze_symbol(symbol):
@@ -371,7 +389,6 @@ def analyze_symbol(symbol):
     dn_trg, dn_trg_r = trigger_score_15m(tf_snaps["15m"], "DOWN", ret_15m)
     direction = choose_direction_from_15m(up_trg, dn_trg)
 
-    # Pick context + trigger for the chosen direction
     if direction == "UP":
         ctx_1h, ctx_1h_r = regime_score(tf_snaps["1h"], "UP")
         ctx_4h, ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
@@ -383,7 +400,6 @@ def analyze_symbol(symbol):
         trg_score, trg_reasons = dn_trg, dn_trg_r
         ctx_dir = "DOWN"
     else:
-        # MIX: still compute a best-effort context direction for reporting
         up_ctx_1h, up_ctx_1h_r = regime_score(tf_snaps["1h"], "UP")
         up_ctx_4h, up_ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
         dn_ctx_1h, dn_ctx_1h_r = regime_score(tf_snaps["1h"], "DOWN")
@@ -398,7 +414,6 @@ def analyze_symbol(symbol):
             ctx_4h, ctx_4h_r = dn_ctx_4h, dn_ctx_4h_r
             ctx_dir = "DOWN-ish"
 
-        # for MIX, keep the stronger trigger for display
         trg_score = max(up_trg, dn_trg)
         trg_reasons = up_trg_r if up_trg >= dn_trg else dn_trg_r
 
@@ -410,13 +425,11 @@ def analyze_symbol(symbol):
     if total_score >= ALERT3_SCORE:
         alert = 3
 
-    # ✅ HARD filters so ALERT 3 = REAL MOMENTUM NOW
-    if alert == 3:
-        if len(trg_reasons) < MIN_TRIGGER_REASONS_FOR_ALERT3:
-            alert = 2
-    if alert == 3:
-        if trg_score < MIN_TRIGGER_SCORE_FOR_ALERT3:
-            alert = 2
+    # HARD filters
+    if alert == 3 and len(trg_reasons) < MIN_TRIGGER_REASONS_FOR_ALERT3:
+        alert = 2
+    if alert == 3 and trg_score < MIN_TRIGGER_SCORE_FOR_ALERT3:
+        alert = 2
     if alert == 3 and BLOCK_ALERT3_IF_DIR_MIX and direction == "MIX":
         alert = 2
 
@@ -447,7 +460,8 @@ def analyze_symbol(symbol):
         "oi_change_pct": oi_change_pct
     }
 
-# ---------- ANTI-SPAM / GATING (AUTO ALERT 3 only) ---------- #
+
+# ---------- ANTI-SPAM / GATING ---------- #
 
 def allowed_to_send(report):
     symbol = report["symbol"]
@@ -482,6 +496,7 @@ def mark_sent(report):
     _last_sent[(symbol, direction)] = time.time()
     _last_alert_level[(symbol, direction)] = alert
     _last_15m_candle[symbol] = candle_ot
+
 
 # ---------- MESSAGE FORMAT ---------- #
 
@@ -602,7 +617,6 @@ def handle_telegram_commands():
         if not text:
             continue
 
-        # Security: respond only to your chat
         if TELEGRAM_CHAT_ID and not is_allowed_chat(chat_id):
             continue
 
@@ -633,6 +647,7 @@ def handle_telegram_commands():
                 send_telegram(f"❌ Manual report error:\n`{e}`", chat_id=chat_id)
             continue
 
+
 # ---------- MAIN SCAN (AUTO PUSH) ---------- #
 
 def run_once():
@@ -644,22 +659,20 @@ def run_once():
             send_telegram(f"⚠️ *Symbol error* `{s}`\n`{e}`")
             continue
 
-    # Only trigger auto-send when we have ALERT 3 and it's allowed (anti-spam)
     triggered = [r for r in reports if r["alert"] == 3 and allowed_to_send(r)]
     if not triggered:
         return
 
-    trig_syms = ", ".join([r["symbol"] for r in triggered])
+    # 1) FULL report per triggered symbol (prevents Telegram length issues)
+    for r in triggered:
+        send_telegram(build_message([r], title=f"🚨 ALERT 3 (FULL) — {r['symbol']}"))
 
-    # 1) FULL report for triggered symbols (deep analysis payload)
-    send_telegram(build_message(triggered, title=f"🚨 ALERT 3 (FULL) — {trig_syms}"))
-
-    # 2) Compact context for the rest (so I see market background without huge spam)
-    others = [r for r in reports if r["symbol"] not in {x["symbol"] for x in triggered}]
+    # 2) Compact context for the rest
+    trig_set = {x["symbol"] for x in triggered}
+    others = [r for r in reports if r["symbol"] not in trig_set]
     if others:
         send_telegram(build_context_compact(others, title="MARKET CONTEXT (compact)"))
 
-    # Mark only triggered as "sent" for cooldown/gating
     for r in triggered:
         mark_sent(r)
 
@@ -680,10 +693,8 @@ if __name__ == "__main__":
 
     while True:
         try:
-            # fast manual commands
             handle_telegram_commands()
 
-            # scheduled market scan
             now = time.time()
             if now - last_scan >= SCAN_SECONDS:
                 run_once()
@@ -694,4 +705,3 @@ if __name__ == "__main__":
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
 
         time.sleep(CMD_POLL_SECONDS)
-
