@@ -544,6 +544,42 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
 
     return msg.strip()
 
+def build_context_compact(reports, title="MARKET CONTEXT (compact)"):
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"🧭 *{title}*\nUTC: `{ts}`\n_(Compact context — no signal.)_\n\n"
+
+    for r in reports:
+        sym = r["symbol"]
+        alert = r["alert"]
+        direction = r["direction"]
+        deriv = r["deriv"]
+        oi_chg = r["oi_change_pct"]
+
+        t1h = r["tf"]["1h"]
+        t15 = r["tf"]["15m"]
+
+        msg += f"*{sym}* | ALERT `{alert}` | DIR `{direction}`\n"
+        msg += (
+            f"Deriv: mark `{fmt_num(deriv['mark'],2)}` | funding `{fmt_num(deriv['funding'],4)}%` | "
+            f"basis `{fmt_num(deriv['basis'],4)}%` | OI `{fmt_num(deriv['oi'],0)}`"
+        )
+        if oi_chg is not None:
+            msg += f" | OIΔ `{fmt_num(oi_chg,2)}%`"
+        msg += "\n"
+
+        msg += (
+            f"`1h` p `{fmt_num(t1h['price'],2)}` | EMA20 `{fmt_num(t1h['ema20'],2)}` | EMA50 `{fmt_num(t1h['ema50'],2)}` | "
+            f"RSI `{fmt_num(t1h['rsi'],1)}`({fmt_num(t1h['rsi_slp'],1)}) | VOLx `{fmt_num(t1h['vol_ratio'],2)}` | ret `{fmt_num(r['returns']['1h'],2)}%`\n"
+        )
+        msg += (
+            f"`15m` p `{fmt_num(t15['price'],2)}` | EMA20 `{fmt_num(t15['ema20'],2)}` | EMA50 `{fmt_num(t15['ema50'],2)}` | "
+            f"RSI `{fmt_num(t15['rsi'],1)}`({fmt_num(t15['rsi_slp'],1)}) | VOLx `{fmt_num(t15['vol_ratio'],2)}` | ret `{fmt_num(r['returns']['15m'],2)}%`\n"
+        )
+        msg += "\n"
+
+    return msg.strip()
+
+
 # ---------- MANUAL COMMAND HANDLER ---------- #
 
 def handle_telegram_commands():
@@ -608,17 +644,25 @@ def run_once():
             send_telegram(f"⚠️ *Symbol error* `{s}`\n`{e}`")
             continue
 
-    active = []
-    for r in reports:
-        if r["alert"] == 3 and allowed_to_send(r):
-            active.append(r)
-
-    if not active:
+    # Only trigger auto-send when we have ALERT 3 and it's allowed (anti-spam)
+    triggered = [r for r in reports if r["alert"] == 3 and allowed_to_send(r)]
+    if not triggered:
         return
 
-    send_telegram(build_message(active, title="🚨 TRADE MOMENT CANDIDATE (ALERT 3)"))
-    for r in active:
+    trig_syms = ", ".join([r["symbol"] for r in triggered])
+
+    # 1) FULL report for triggered symbols (deep analysis payload)
+    send_telegram(build_message(triggered, title=f"🚨 ALERT 3 (FULL) — {trig_syms}"))
+
+    # 2) Compact context for the rest (so I see market background without huge spam)
+    others = [r for r in reports if r["symbol"] not in {x["symbol"] for x in triggered}]
+    if others:
+        send_telegram(build_context_compact(others, title="MARKET CONTEXT (compact)"))
+
+    # Mark only triggered as "sent" for cooldown/gating
+    for r in triggered:
         mark_sent(r)
+
 
 # ---------- RUNNER ---------- #
 
@@ -650,3 +694,4 @@ if __name__ == "__main__":
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
 
         time.sleep(CMD_POLL_SECONDS)
+
