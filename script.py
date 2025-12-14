@@ -52,6 +52,14 @@ RETURN_LOOKBACK_4H = 6    # ~24 hours
 ALERT2_SCORE = 5
 ALERT3_SCORE = 7
 
+MIN_PRICE_MOVE = {
+    "BTCUSDT": 0.25,
+    "ETHUSDT": 0.30,
+    "SOLUSDT": 0.40
+}
+
+_last_alert_price = {}
+
 # HARD rules: ALERT 3 == "REAL momentum NOW"
 MIN_TRIGGER_SCORE_FOR_ALERT3 = 4
 MIN_TRIGGER_REASONS_FOR_ALERT3 = 2
@@ -464,10 +472,19 @@ def analyze_symbol(symbol):
 # ---------- ANTI-SPAM / GATING ---------- #
 
 def allowed_to_send(report):
+    """
+    AUTO push gating — LIVE MODE anti-spam.
+    Sends ONLY when alert==3, and ONLY when it is a NEW event (edge),
+    on a NEW 15m candle, with real price movement + cooldown.
+    """
     symbol = report["symbol"]
     direction = report["direction"]
     alert = report["alert"]
     now = time.time()
+
+    # 0) Auto push ONLY for ALERT 3
+    if alert != 3:
+        return False
 
     key = (symbol, direction)
     last_sent = _last_sent.get(key)
@@ -476,16 +493,30 @@ def allowed_to_send(report):
     candle_ot = report["tf"]["15m"]["open_time"]
     last_candle_for_symbol = _last_15m_candle.get(symbol)
 
-    if alert > last_level:
-        return True
-
-    if last_sent is not None and (now - last_sent) < COOLDOWN_ALERT3:
-        return False
-
+    # 1) Only once per NEW 15m candle (no re-sending inside the same 15m bar)
     if last_candle_for_symbol is not None and candle_ot == last_candle_for_symbol:
         return False
 
+    # 2) Rising-edge only: allow only if last_level < 3 (new ALERT 3 event)
+    # This prevents spam like 3->2->3 within ranges.
+    if last_level >= 3:
+        return False
+
+    # 3) Cooldown (extra safety): if we've sent recently for this symbol+direction, block
+    if last_sent is not None and (now - last_sent) < COOLDOWN_ALERT3:
+        return False
+
+    # 4) Require REAL price movement since last sent ALERT 3 for this symbol
+    last_price = _last_alert_price.get(symbol)
+    curr_price = report["tf"]["15m"]["price"]
+    if last_price is not None and last_price > 0:
+        move_pct = abs((curr_price - last_price) / last_price) * 100.0
+        min_move = MIN_PRICE_MOVE.get(symbol, 0.30)
+        if move_pct < min_move:
+            return False
+
     return True
+
 
 def mark_sent(report):
     symbol = report["symbol"]
@@ -496,6 +527,9 @@ def mark_sent(report):
     _last_sent[(symbol, direction)] = time.time()
     _last_alert_level[(symbol, direction)] = alert
     _last_15m_candle[symbol] = candle_ot
+
+    # NEW: store last price for anti-spam price-move gate
+    _last_alert_price[symbol] = report["tf"]["15m"]["price"]
 
 
 # ---------- MESSAGE FORMAT ---------- #
@@ -705,3 +739,4 @@ if __name__ == "__main__":
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
 
         time.sleep(CMD_POLL_SECONDS)
+
