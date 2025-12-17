@@ -1,10 +1,18 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.4 (ANTI-RATE, INCREMENTAL KLINES)
-Key upgrade:
-- Kline caching per (symbol, tf)
-- Incremental updates: fetch ONLY last 2 candles each scan
-- 1h/4h do NOT re-download history each scan
-- Soft rate limiter + backoff for Binance -1003/-1015 and HTTP 429/418
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.5 (FINAL)
+GOAL:
+- Bot runs continuously, BUT notifies you ONLY when there is a REAL momentum moment.
+- No trade signals. Scanner only (input for deeper analysis).
+
+FINAL rules:
+- Auto-push ONLY for ALERT 3
+- ALERT 3 requires:
+  1) 15m direction NOT MIX
+  2) strong 15m trigger score
+  3) enough trigger reasons
+  4) HARD: 15m VOLx must be >= 1.15 (real aggression NOW)
+- Incremental klines (fetch last 2 candles only each scan)
+- Soft rate limiter + backoff (protect vs Binance rate-limits/blocks)
 """
 
 import os
@@ -35,32 +43,38 @@ RETURN_LOOKBACK_4H = 6
 ALERT2_SCORE = 5
 ALERT3_SCORE = 7
 
-MIN_PRICE_MOVE = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
-_last_alert_price = {}
-
+# HARD rules
 MIN_TRIGGER_SCORE_FOR_ALERT3 = 4
 MIN_TRIGGER_REASONS_FOR_ALERT3 = 2
 BLOCK_ALERT3_IF_DIR_MIX = True
 
+# FINAL HARD aggression filter
+REQUIRE_VOLX_FOR_ALERT3 = 1.15
+
+# Anti-spam
 COOLDOWN_ALERT3 = 90 * 60
 DIR_MIX_BAND = 1
 
+MIN_PRICE_MOVE = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
+_last_alert_price = {}
+
+# Scheduling
 CMD_POLL_SECONDS = 5
 SCAN_SECONDS = 300
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ---- v4.4: rate protection ----
-REQUEST_LOG = deque(maxlen=600)     # timestamps of recent requests
-MAX_REQ_PER_MIN = 90               # conservative
+# ---- rate protection ----
+REQUEST_LOG = deque(maxlen=600)
+MAX_REQ_PER_MIN = 90
 BACKOFF_BASE = 1.5
 BACKOFF_MAX = 30.0
 
-# ---- v4.4: kline cache ----
-KLINE_SEED_LIMIT = 220             # one-time history seed
-KLINE_MIN_BARS = 120               # minimum bars needed for stable indicators
-KLINE_TAIL_FETCH = 2               # incremental update only needs last 2 bars
+# ---- kline cache ----
+KLINE_SEED_LIMIT = 220
+KLINE_MIN_BARS = 120
+KLINE_TAIL_FETCH = 2
 
 # ============================================ #
 
@@ -70,10 +84,9 @@ _last_15m_candle = {}
 _prev_oi = {}
 _last_update_id = 0
 
-# In-memory caches
 _KLINE_CACHE = {}     # (symbol, tf) -> np.array of klines float
 _DERIV_CACHE = {}     # symbol -> (ts, deriv_dict)
-DERIV_TTL_SEC = 30    # derivatives refresh interval
+DERIV_TTL_SEC = 30
 
 # ---------- RATE LIMIT HELPERS ---------- #
 
@@ -90,17 +103,14 @@ def _rate_guard():
         time.sleep(1.2)
 
 def _should_backoff(resp, json_data):
-    # HTTP level
     if resp is not None and resp.status_code in (418, 429):
-        return True, "HTTP"
-    # Binance error codes
+        return True
     if isinstance(json_data, dict) and "code" in json_data:
-        if json_data["code"] in (-1003, -1015):  # rate limit
-            return True, "CODE"
-    return False, None
+        if json_data["code"] in (-1003, -1015):
+            return True
+    return False
 
 def _sleep_backoff(attempt):
-    # exponential-ish backoff with cap
     s = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt))
     time.sleep(s)
 
@@ -111,21 +121,18 @@ def http_get_json(url, params=None, timeout=10):
         _rate_guard()
         try:
             r = requests.get(url, params=params, timeout=timeout)
-            # try parse json even on non-200
             try:
                 data = r.json()
             except Exception:
                 data = None
 
             if r.status_code >= 400:
-                backoff, _ = _should_backoff(r, data)
-                if backoff:
+                if _should_backoff(r, data):
                     _sleep_backoff(attempt)
                     continue
                 r.raise_for_status()
 
-            backoff, _ = _should_backoff(r, data)
-            if backoff:
+            if _should_backoff(r, data):
                 _sleep_backoff(attempt)
                 continue
 
@@ -146,14 +153,12 @@ def http_post_json(url, payload, timeout=10):
                 data = {"ok": True, "raw": r.text[:200]}
 
             if r.status_code >= 400:
-                backoff, _ = _should_backoff(r, data)
-                if backoff:
+                if _should_backoff(r, data):
                     _sleep_backoff(attempt)
                     continue
                 r.raise_for_status()
 
-            backoff, _ = _should_backoff(r, data)
-            if backoff:
+            if _should_backoff(r, data):
                 _sleep_backoff(attempt)
                 continue
 
@@ -255,42 +260,29 @@ def _fetch_klines_raw(symbol, interval, limit=200):
     return np.array(data, dtype=float)
 
 def get_klines_cached(symbol, tf):
-    """
-    Returns klines for (symbol, tf) using incremental update:
-    - seed full history once (KLINE_SEED_LIMIT)
-    - every call: fetch last 2 candles and update/append
-    """
     key = (symbol, tf)
     interval = TIMEFRAMES[tf]
 
-    # Seed
     if key not in _KLINE_CACHE:
         k = _fetch_klines_raw(symbol, interval, limit=KLINE_SEED_LIMIT)
         _KLINE_CACHE[key] = k
-        return _KLINE_CACHE[key]
+        return k
 
     k = _KLINE_CACHE[key]
-    # If cache too short (restart / memory loss), re-seed
     if k is None or len(k) < KLINE_MIN_BARS:
         k = _fetch_klines_raw(symbol, interval, limit=KLINE_SEED_LIMIT)
         _KLINE_CACHE[key] = k
         return k
 
-    # Incremental update: only last 2
     tail = _fetch_klines_raw(symbol, interval, limit=KLINE_TAIL_FETCH)
 
-    # Update logic by open_time
     for row in tail:
         ot = row[0]
         if ot == k[-1, 0]:
             k[-1] = row
         elif ot > k[-1, 0]:
             k = np.vstack([k, row])
-        else:
-            # ignore older
-            pass
 
-    # keep size bounded (avoid memory growth)
     if len(k) > 400:
         k = k[-350:]
 
@@ -298,9 +290,6 @@ def get_klines_cached(symbol, tf):
     return k
 
 def fetch_derivatives_cached(symbol):
-    """
-    Cache derivatives to reduce calls. Refresh every DERIV_TTL_SEC.
-    """
     now = time.time()
     hit = _DERIV_CACHE.get(symbol)
     if hit and (now - hit[0] < DERIV_TTL_SEC):
@@ -352,9 +341,7 @@ def tf_snapshot(k, tf_name):
         "rsi_slp": float(rsi_slp),
         "atr": float(atr_v[-1]) if not np.isnan(atr_v[-1]) else float(np.nan),
         "vol_ratio": float(vol_ratio),
-        "close_series": close,
-        "high_series": high,
-        "low_series": low,
+        "close_series": close
     }
 
 def tf_trend_label(snap):
@@ -372,6 +359,8 @@ def compute_returns(tf_snaps):
         lb = RETURN_LOOKBACK_15M if tf == "15m" else RETURN_LOOKBACK_1H if tf == "1h" else RETURN_LOOKBACK_4H
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
+
+# ---------- CONTEXT / TRIGGER ---------- #
 
 def regime_score(tf_snap, direction):
     price, e20, e50 = tf_snap["price"], tf_snap["ema20"], tf_snap["ema50"]
@@ -395,6 +384,7 @@ def trigger_score_15m(tf15, direction, ret_15m):
     rsi, rsi_slp, vol_ratio = tf15["rsi"], tf15["rsi_slp"], tf15["vol_ratio"]
     score = 0
     reasons = []
+
     if direction == "UP":
         if price > e20: score += 1; reasons.append("15m price above EMA20")
         if price > e20 and price > e50: score += 1; reasons.append("15m price above EMA20/50")
@@ -411,6 +401,7 @@ def trigger_score_15m(tf15, direction, ret_15m):
         if vol_ratio >= 1.15: score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
         if ret_15m <= -0.15: score += 1; reasons.append(f"15m return negative ({ret_15m:+.2f}%)")
         if vol_ratio >= 1.25 and rsi_slp <= -5: score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
+
     return score, reasons
 
 def choose_direction_from_15m(up_trg, dn_trg):
@@ -480,15 +471,14 @@ def analyze_symbol(symbol):
     if alert == 3 and BLOCK_ALERT3_IF_DIR_MIX and direction == "MIX":
         alert = 2
 
-    # v4.5 HARD: ALERT 3 must have real 15m aggression
-    REQUIRE_VOLX_FOR_ALERT3 = 1.15
+    # FINAL HARD: real aggression NOW
     if alert == 3:
         volx_15m = tf_snaps["15m"]["vol_ratio"]
         if volx_15m < REQUIRE_VOLX_FOR_ALERT3:
             alert = 2
 
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
-    tf_public = {k: {kk: vv for kk, vv in v.items() if kk not in ("close_series","high_series","low_series")} for k, v in tf_snaps.items()}
+    tf_public = {k: {kk: vv for kk, vv in v.items() if kk != "close_series"} for k, v in tf_snaps.items()}
 
     reasons = []
     reasons += [f"Context scored as: {ctx_dir}"]
@@ -514,7 +504,7 @@ def analyze_symbol(symbol):
         "oi_change_pct": oi_change_pct
     }
 
-# ---------- AUTO PUSH GATING (same logic as before, minimal) ---------- #
+# ---------- ANTI-SPAM / GATING ---------- #
 
 def allowed_to_send(report):
     symbol = report["symbol"]
@@ -528,6 +518,7 @@ def allowed_to_send(report):
     key = (symbol, direction)
     last_sent = _last_sent.get(key)
     last_level = _last_alert_level.get(key, 0)
+
     candle_ot = report["tf"]["15m"]["open_time"]
     last_candle_for_symbol = _last_15m_candle.get(symbol)
 
@@ -553,6 +544,7 @@ def mark_sent(report):
     direction = report["direction"]
     alert = report["alert"]
     candle_ot = report["tf"]["15m"]["open_time"]
+
     _last_sent[(symbol, direction)] = time.time()
     _last_alert_level[(symbol, direction)] = alert
     _last_15m_candle[symbol] = candle_ot
@@ -570,20 +562,23 @@ def fmt_num(x, digits=2):
 
 def build_message(reports, title="MOMENTUM FILTER REPORT"):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"📊 *{title}*\nUTC: `{ts}`\n_(Scanner only — not a signal. Use as input for analysis.)_\n\n"
+    msg = f"📊 *{title}*\nUTC: `{ts}`\n"
+    msg += "_(Scanner only — not a signal. Use as input for analysis.)_\n\n"
 
     for r in reports:
         sym = r["symbol"]
         alert = r["alert"]
         direction = r["direction"]
         total = r["total_score"]
+        up_trg = r["up_trg"]
+        dn_trg = r["dn_trg"]
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
 
         msg += (
             f"*{sym}*  |  *ALERT {alert}*  |  *DIR (15m): {direction}*  |  "
             f"total `{total}` (ctx1h `{r['ctx_1h']}` + ctx4h `{r['ctx_4h']}` + trg `{r['trg_score']}`)\n"
-            f"Triggers: UP `{r['up_trg']}` / DOWN `{r['dn_trg']}`\n"
+            f"Triggers: UP `{up_trg}` / DOWN `{dn_trg}`\n"
         )
 
         msg += (
@@ -619,15 +614,18 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
 def build_context_compact(reports, title="MARKET CONTEXT (compact)"):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     msg = f"🧭 *{title}*\nUTC: `{ts}`\n_(Compact context — no signal.)_\n\n"
+
     for r in reports:
         sym = r["symbol"]
+        alert = r["alert"]
         direction = r["direction"]
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
+
         t1h = r["tf"]["1h"]
         t15 = r["tf"]["15m"]
 
-        msg += f"*{sym}* | ALERT `{r['alert']}` | DIR `{direction}`\n"
+        msg += f"*{sym}* | ALERT `{alert}` | DIR `{direction}`\n"
         msg += (
             f"Deriv: mark `{fmt_num(deriv['mark'],2)}` | funding `{fmt_num(deriv['funding'],4)}%` | "
             f"basis `{fmt_num(deriv['basis'],4)}%` | OI `{fmt_num(deriv['oi'],0)}`"
@@ -645,6 +643,7 @@ def build_context_compact(reports, title="MARKET CONTEXT (compact)"):
             f"RSI `{fmt_num(t15['rsi'],1)}`({fmt_num(t15['rsi_slp'],1)}) | VOLx `{fmt_num(t15['vol_ratio'],2)}` | ret `{fmt_num(r['returns']['15m'],2)}%`\n"
         )
         msg += "\n"
+
     return msg.strip()
 
 # ---------- MANUAL COMMAND HANDLER ---------- #
@@ -672,7 +671,7 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v4.4 incremental klines: 1h/4h not re-downloaded each scan.\n"
+                "v4.5 FINAL: incremental klines + rate limiter + VOLx hard filter for ALERT 3.\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
@@ -729,14 +728,13 @@ if __name__ == "__main__":
         telegram_delete_webhook()
         send_telegram(
             "✅ Momentum Filter bot is ONLINE.\n"
-            "v4.4: Incremental klines + rate limiter/backoff.\n"
+            "v4.5 FINAL: incremental klines + rate limiter/backoff + VOLx hard filter.\n"
             "Auto: ONLY ALERT 3.\n"
             "Manual: /report or /report ETHUSDT.\n"
             "Scan runs every 5 min."
         )
 
     last_scan = 0
-
     while True:
         try:
             handle_telegram_commands()
@@ -748,4 +746,3 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
         time.sleep(CMD_POLL_SECONDS)
-
