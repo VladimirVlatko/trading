@@ -1,28 +1,10 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.1 (FINAL)
-GOAL:
-- Bot runs continuously, BUT notifies you ONLY when there is a REAL momentum moment.
-- No trade signals. Scanner only (input for deeper analysis).
-
-AUTO PUSH (Telegram):
-- Sends message ONLY when ALERT == 3
-- ALERT 3 is ONLY allowed when:
-  1) 15m direction is clear (UP or DOWN)  -> NO MIX for alert 3
-  2) 15m trigger score is strong         -> MIN_TRIGGER_SCORE_FOR_ALERT3
-  3) at least MIN_TRIGGER_REASONS_FOR_ALERT3 are present
-
-AUTO PUSH payload (for analysis):
-- Sends FULL report per triggered symbol (safe vs Telegram 4096 limit)
-- Then sends COMPACT context for the other symbols
-
-MANUAL PULL (Telegram commands):
-- /report            -> report for all symbols
-- /report ETHUSDT    -> report for one symbol
-- /status            -> bot status
-
-Timing:
-- Commands polled every CMD_POLL_SECONDS (fast)
-- Market scan runs every SCAN_SECONDS (5 min)
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.4 (ANTI-RATE, INCREMENTAL KLINES)
+Key upgrade:
+- Kline caching per (symbol, tf)
+- Incremental updates: fetch ONLY last 2 candles each scan
+- 1h/4h do NOT re-download history each scan
+- Soft rate limiter + backoff for Binance -1003/-1015 and HTTP 429/418
 """
 
 import os
@@ -30,6 +12,7 @@ import time
 import requests
 import numpy as np
 from datetime import datetime, UTC
+from collections import deque
 
 # ================== CONFIG ================== #
 
@@ -45,73 +28,140 @@ ATR_LEN = 14
 VOL_LOOKBACK = 20
 SLOPE_LOOKBACK = 6
 
-RETURN_LOOKBACK_15M = 6   # ~90 mins
-RETURN_LOOKBACK_1H = 6    # ~6 hours
-RETURN_LOOKBACK_4H = 6    # ~24 hours
+RETURN_LOOKBACK_15M = 6
+RETURN_LOOKBACK_1H = 6
+RETURN_LOOKBACK_4H = 6
 
 ALERT2_SCORE = 5
 ALERT3_SCORE = 7
 
-MIN_PRICE_MOVE = {
-    "BTCUSDT": 0.25,
-    "ETHUSDT": 0.30,
-    "SOLUSDT": 0.40
-}
-
+MIN_PRICE_MOVE = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
 _last_alert_price = {}
 
-# HARD rules: ALERT 3 == "REAL momentum NOW"
 MIN_TRIGGER_SCORE_FOR_ALERT3 = 4
 MIN_TRIGGER_REASONS_FOR_ALERT3 = 2
 BLOCK_ALERT3_IF_DIR_MIX = True
 
-# Anti-spam
-COOLDOWN_ALERT3 = 90 * 60   # 90 minutes
-DIR_MIX_BAND = 1            # if |up_trg - dn_trg| <= 1 -> MIX
+COOLDOWN_ALERT3 = 90 * 60
+DIR_MIX_BAND = 1
 
-# Scheduling
 CMD_POLL_SECONDS = 5
 SCAN_SECONDS = 300
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # numeric string
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# ---- v4.4: rate protection ----
+REQUEST_LOG = deque(maxlen=600)     # timestamps of recent requests
+MAX_REQ_PER_MIN = 90               # conservative
+BACKOFF_BASE = 1.5
+BACKOFF_MAX = 30.0
+
+# ---- v4.4: kline cache ----
+KLINE_SEED_LIMIT = 220             # one-time history seed
+KLINE_MIN_BARS = 120               # minimum bars needed for stable indicators
+KLINE_TAIL_FETCH = 2               # incremental update only needs last 2 bars
 
 # ============================================ #
 
-_last_sent = {}           # (symbol, direction) -> timestamp
-_last_alert_level = {}    # (symbol, direction) -> last alert sent
-_last_15m_candle = {}     # symbol -> last 15m open_time(ms) that produced an AUTO message
-_prev_oi = {}             # symbol -> last open interest
-_last_update_id = 0       # Telegram polling offset
+_last_sent = {}
+_last_alert_level = {}
+_last_15m_candle = {}
+_prev_oi = {}
+_last_update_id = 0
 
+# In-memory caches
+_KLINE_CACHE = {}     # (symbol, tf) -> np.array of klines float
+_DERIV_CACHE = {}     # symbol -> (ts, deriv_dict)
+DERIV_TTL_SEC = 30    # derivatives refresh interval
+
+# ---------- RATE LIMIT HELPERS ---------- #
+
+def _rate_guard():
+    now = time.time()
+    REQUEST_LOG.append(now)
+    recent = 0
+    for t in reversed(REQUEST_LOG):
+        if now - t < 60:
+            recent += 1
+        else:
+            break
+    if recent > MAX_REQ_PER_MIN:
+        time.sleep(1.2)
+
+def _should_backoff(resp, json_data):
+    # HTTP level
+    if resp is not None and resp.status_code in (418, 429):
+        return True, "HTTP"
+    # Binance error codes
+    if isinstance(json_data, dict) and "code" in json_data:
+        if json_data["code"] in (-1003, -1015):  # rate limit
+            return True, "CODE"
+    return False, None
+
+def _sleep_backoff(attempt):
+    # exponential-ish backoff with cap
+    s = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt))
+    time.sleep(s)
 
 # ---------- NETWORK HELPERS ---------- #
 
 def http_get_json(url, params=None, timeout=10):
-    for attempt in range(2):
+    for attempt in range(5):
+        _rate_guard()
         try:
             r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
+            # try parse json even on non-200
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+
+            if r.status_code >= 400:
+                backoff, _ = _should_backoff(r, data)
+                if backoff:
+                    _sleep_backoff(attempt)
+                    continue
+                r.raise_for_status()
+
+            backoff, _ = _should_backoff(r, data)
+            if backoff:
+                _sleep_backoff(attempt)
+                continue
+
+            return data
         except Exception:
-            if attempt == 1:
+            if attempt == 4:
                 raise
-            time.sleep(0.5)
+            _sleep_backoff(attempt)
 
 def http_post_json(url, payload, timeout=10):
-    for attempt in range(2):
+    for attempt in range(5):
+        _rate_guard()
         try:
             r = requests.post(url, json=payload, timeout=timeout)
-            r.raise_for_status()
             try:
-                return r.json()
+                data = r.json()
             except Exception:
-                return {"ok": True, "raw": r.text[:200]}
-        except Exception:
-            if attempt == 1:
-                raise
-            time.sleep(0.5)
+                data = {"ok": True, "raw": r.text[:200]}
 
+            if r.status_code >= 400:
+                backoff, _ = _should_backoff(r, data)
+                if backoff:
+                    _sleep_backoff(attempt)
+                    continue
+                r.raise_for_status()
+
+            backoff, _ = _should_backoff(r, data)
+            if backoff:
+                _sleep_backoff(attempt)
+                continue
+
+            return data
+        except Exception:
+            if attempt == 4:
+                raise
+            _sleep_backoff(attempt)
 
 # ---------- TELEGRAM ---------- #
 
@@ -121,11 +171,8 @@ def send_telegram(message: str, chat_id: str | None = None):
     target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
     if not target:
         return
-
-    # Telegram limit safety (Markdown + headroom)
     if message and len(message) > 3900:
         message = message[:3900] + "\n…(truncated)"
-
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": target, "text": message, "parse_mode": "Markdown"}
     http_post_json(url, payload, timeout=10)
@@ -144,11 +191,10 @@ def telegram_get_updates(offset=None, timeout=0):
     if offset is not None:
         params["offset"] = offset
     data = http_get_json(url, params=params, timeout=10)
-    return data.get("result", [])
+    return data.get("result", []) if isinstance(data, dict) else []
 
 def is_allowed_chat(chat_id: str) -> bool:
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
-
 
 # ---------- INDICATORS ---------- #
 
@@ -165,65 +211,101 @@ def rsi_wilder(close, length=14):
     close = np.asarray(close, dtype=float)
     if len(close) < length + 2:
         return np.full_like(close, 50.0)
-
     delta = np.diff(close)
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
-
     rsi_vals = np.empty(len(close))
     rsi_vals[:length] = 50.0
-
     avg_gain = np.mean(gain[:length])
     avg_loss = np.mean(loss[:length])
-
     rs = avg_gain / (avg_loss + 1e-12)
     rsi_vals[length] = 100 - (100 / (1 + rs))
-
     for i in range(length + 1, len(close)):
         avg_gain = (avg_gain * (length - 1) + gain[i - 1]) / length
         avg_loss = (avg_loss * (length - 1) + loss[i - 1]) / length
         rs = avg_gain / (avg_loss + 1e-12)
         rsi_vals[i] = 100 - (100 / (1 + rs))
-
     return rsi_vals
 
 def atr_wilder(high, low, close, length=14):
     high = np.asarray(high, dtype=float)
     low = np.asarray(low, dtype=float)
     close = np.asarray(close, dtype=float)
-
     if len(close) < length + 2:
         return np.full_like(close, np.nan)
-
     tr = np.empty(len(close))
     tr[0] = high[0] - low[0]
     for i in range(1, len(close)):
-        tr[i] = max(
-            high[i] - low[i],
-            abs(high[i] - close[i - 1]),
-            abs(low[i] - close[i - 1])
-        )
-
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
     atr = np.empty(len(close))
     atr[:length] = np.mean(tr[:length])
     for i in range(length, len(close)):
         atr[i] = (atr[i - 1] * (length - 1) + tr[i]) / length
-
     return atr
 
 def pct_change(a, b):
     return ((a - b) / (b + 1e-12)) * 100.0
 
+# ---------- BINANCE DATA (INCREMENTAL) ---------- #
 
-# ---------- DATA ---------- #
-
-def fetch_klines(symbol, interval, limit=180):
+def _fetch_klines_raw(symbol, interval, limit=200):
     url = f"{BINANCE_FUTURES}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     data = http_get_json(url, params=params, timeout=10)
     return np.array(data, dtype=float)
 
-def fetch_derivatives(symbol):
+def get_klines_cached(symbol, tf):
+    """
+    Returns klines for (symbol, tf) using incremental update:
+    - seed full history once (KLINE_SEED_LIMIT)
+    - every call: fetch last 2 candles and update/append
+    """
+    key = (symbol, tf)
+    interval = TIMEFRAMES[tf]
+
+    # Seed
+    if key not in _KLINE_CACHE:
+        k = _fetch_klines_raw(symbol, interval, limit=KLINE_SEED_LIMIT)
+        _KLINE_CACHE[key] = k
+        return _KLINE_CACHE[key]
+
+    k = _KLINE_CACHE[key]
+    # If cache too short (restart / memory loss), re-seed
+    if k is None or len(k) < KLINE_MIN_BARS:
+        k = _fetch_klines_raw(symbol, interval, limit=KLINE_SEED_LIMIT)
+        _KLINE_CACHE[key] = k
+        return k
+
+    # Incremental update: only last 2
+    tail = _fetch_klines_raw(symbol, interval, limit=KLINE_TAIL_FETCH)
+
+    # Update logic by open_time
+    for row in tail:
+        ot = row[0]
+        if ot == k[-1, 0]:
+            k[-1] = row
+        elif ot > k[-1, 0]:
+            k = np.vstack([k, row])
+        else:
+            # ignore older
+            pass
+
+    # keep size bounded (avoid memory growth)
+    if len(k) > 400:
+        k = k[-350:]
+
+    _KLINE_CACHE[key] = k
+    return k
+
+def fetch_derivatives_cached(symbol):
+    """
+    Cache derivatives to reduce calls. Refresh every DERIV_TTL_SEC.
+    """
+    now = time.time()
+    hit = _DERIV_CACHE.get(symbol)
+    if hit and (now - hit[0] < DERIV_TTL_SEC):
+        return hit[1]
+
     mark = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
     oi = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=10)
 
@@ -233,8 +315,9 @@ def fetch_derivatives(symbol):
     basis_pct = (mark_price - index_price) / (index_price + 1e-12) * 100.0
     oi_val = float(oi["openInterest"])
 
-    return {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
-
+    d = {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
+    _DERIV_CACHE[symbol] = (now, d)
+    return d
 
 # ---------- SNAPSHOT ---------- #
 
@@ -255,7 +338,7 @@ def tf_snapshot(k, tf_name):
     rsi_slp = rsi_v[-1] - rsi_v[-1 - sl] if len(rsi_v) > sl else 0.0
 
     vol_ratio = vol[-1] / (np.mean(vol[-VOL_LOOKBACK:]) + 1e-12) if len(vol) >= VOL_LOOKBACK else 1.0
-    open_time = int(k[-1, 0])  # ms
+    open_time = int(k[-1, 0])
 
     return {
         "tf": tf_name,
@@ -269,11 +352,10 @@ def tf_snapshot(k, tf_name):
         "rsi_slp": float(rsi_slp),
         "atr": float(atr_v[-1]) if not np.isnan(atr_v[-1]) else float(np.nan),
         "vol_ratio": float(vol_ratio),
-        "close_series": close
+        "close_series": close,
+        "high_series": high,
+        "low_series": low,
     }
-
-
-# ---------- LABELS / RETURNS ---------- #
 
 def tf_trend_label(snap):
     price, e20, e50 = snap["price"], snap["ema20"], snap["ema50"]
@@ -287,87 +369,48 @@ def compute_returns(tf_snaps):
     out = {}
     for tf, snap in tf_snaps.items():
         close = snap["close_series"]
-        if tf == "15m":
-            lb = RETURN_LOOKBACK_15M
-        elif tf == "1h":
-            lb = RETURN_LOOKBACK_1H
-        else:
-            lb = RETURN_LOOKBACK_4H
+        lb = RETURN_LOOKBACK_15M if tf == "15m" else RETURN_LOOKBACK_1H if tf == "1h" else RETURN_LOOKBACK_4H
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
-
-
-# ---------- CONTEXT (HTF) ---------- #
 
 def regime_score(tf_snap, direction):
     price, e20, e50 = tf_snap["price"], tf_snap["ema20"], tf_snap["ema50"]
     e20_slp, e50_slp, rsi = tf_snap["ema20_slp"], tf_snap["ema50_slp"], tf_snap["rsi"]
-
     score = 0
     reasons = []
-
     if direction == "UP":
-        if price > e20 and price > e50:
-            score += 2; reasons.append("HTF price above EMA20/50")
-        if e20 > e50:
-            score += 1; reasons.append("HTF EMA20 > EMA50")
-        if e20_slp > 0 and e50_slp > 0:
-            score += 1; reasons.append("HTF EMA slopes positive")
-        if rsi >= 52:
-            score += 1; reasons.append("HTF RSI supportive")
+        if price > e20 and price > e50: score += 2; reasons.append("HTF price above EMA20/50")
+        if e20 > e50: score += 1; reasons.append("HTF EMA20 > EMA50")
+        if e20_slp > 0 and e50_slp > 0: score += 1; reasons.append("HTF EMA slopes positive")
+        if rsi >= 52: score += 1; reasons.append("HTF RSI supportive")
     else:
-        if price < e20 and price < e50:
-            score += 2; reasons.append("HTF price below EMA20/50")
-        if e20 < e50:
-            score += 1; reasons.append("HTF EMA20 < EMA50")
-        if e20_slp < 0 and e50_slp < 0:
-            score += 1; reasons.append("HTF EMA slopes negative")
-        if rsi <= 48:
-            score += 1; reasons.append("HTF RSI weak")
-
+        if price < e20 and price < e50: score += 2; reasons.append("HTF price below EMA20/50")
+        if e20 < e50: score += 1; reasons.append("HTF EMA20 < EMA50")
+        if e20_slp < 0 and e50_slp < 0: score += 1; reasons.append("HTF EMA slopes negative")
+        if rsi <= 48: score += 1; reasons.append("HTF RSI weak")
     return score, reasons
-
-
-# ---------- 15m TRIGGER (direction driver) ---------- #
 
 def trigger_score_15m(tf15, direction, ret_15m):
     price, e20, e50 = tf15["price"], tf15["ema20"], tf15["ema50"]
     rsi, rsi_slp, vol_ratio = tf15["rsi"], tf15["rsi_slp"], tf15["vol_ratio"]
-
     score = 0
     reasons = []
-
     if direction == "UP":
-        if price > e20:
-            score += 1; reasons.append("15m price above EMA20")
-        if price > e20 and price > e50:
-            score += 1; reasons.append("15m price above EMA20/50")
-        if rsi >= 53:
-            score += 1; reasons.append("15m RSI high")
-        if rsi_slp >= 3:
-            score += 1; reasons.append("15m RSI rising")
-        if vol_ratio >= 1.15:
-            score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
-        if ret_15m >= 0.15:
-            score += 1; reasons.append(f"15m return positive ({ret_15m:+.2f}%)")
-        if vol_ratio >= 1.25 and rsi_slp >= 5:
-            score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
+        if price > e20: score += 1; reasons.append("15m price above EMA20")
+        if price > e20 and price > e50: score += 1; reasons.append("15m price above EMA20/50")
+        if rsi >= 53: score += 1; reasons.append("15m RSI high")
+        if rsi_slp >= 3: score += 1; reasons.append("15m RSI rising")
+        if vol_ratio >= 1.15: score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
+        if ret_15m >= 0.15: score += 1; reasons.append(f"15m return positive ({ret_15m:+.2f}%)")
+        if vol_ratio >= 1.25 and rsi_slp >= 5: score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
     else:
-        if price < e20:
-            score += 1; reasons.append("15m price below EMA20")
-        if price < e20 and price < e50:
-            score += 1; reasons.append("15m price below EMA20/50")
-        if rsi <= 47:
-            score += 1; reasons.append("15m RSI low")
-        if rsi_slp <= -3:
-            score += 1; reasons.append("15m RSI falling")
-        if vol_ratio >= 1.15:
-            score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
-        if ret_15m <= -0.15:
-            score += 1; reasons.append(f"15m return negative ({ret_15m:+.2f}%)")
-        if vol_ratio >= 1.25 and rsi_slp <= -5:
-            score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
-
+        if price < e20: score += 1; reasons.append("15m price below EMA20")
+        if price < e20 and price < e50: score += 1; reasons.append("15m price below EMA20/50")
+        if rsi <= 47: score += 1; reasons.append("15m RSI low")
+        if rsi_slp <= -3: score += 1; reasons.append("15m RSI falling")
+        if vol_ratio >= 1.15: score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
+        if ret_15m <= -0.15: score += 1; reasons.append(f"15m return negative ({ret_15m:+.2f}%)")
+        if vol_ratio >= 1.25 and rsi_slp <= -5: score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
     return score, reasons
 
 def choose_direction_from_15m(up_trg, dn_trg):
@@ -376,19 +419,18 @@ def choose_direction_from_15m(up_trg, dn_trg):
         return "MIX"
     return "UP" if diff > 0 else "DOWN"
 
-
 # ---------- ANALYSIS ---------- #
 
 def analyze_symbol(symbol):
     tf_snaps = {}
-    for tf, interval in TIMEFRAMES.items():
-        k = fetch_klines(symbol, interval, limit=180)
+    for tf in TIMEFRAMES.keys():
+        k = get_klines_cached(symbol, tf)
         tf_snaps[tf] = tf_snapshot(k, tf)
 
     returns = compute_returns(tf_snaps)
     ret_15m = returns["15m"]
 
-    deriv = fetch_derivatives(symbol)
+    deriv = fetch_derivatives_cached(symbol)
     prev_oi = _prev_oi.get(symbol)
     oi_change_pct = pct_change(deriv["oi"], prev_oi) if prev_oi and prev_oi > 0 else None
     _prev_oi[symbol] = deriv["oi"]
@@ -412,7 +454,6 @@ def analyze_symbol(symbol):
         up_ctx_4h, up_ctx_4h_r = regime_score(tf_snaps["4h"], "UP")
         dn_ctx_1h, dn_ctx_1h_r = regime_score(tf_snaps["1h"], "DOWN")
         dn_ctx_4h, dn_ctx_4h_r = regime_score(tf_snaps["4h"], "DOWN")
-
         if (up_ctx_1h + up_ctx_4h) >= (dn_ctx_1h + dn_ctx_4h):
             ctx_1h, ctx_1h_r = up_ctx_1h, up_ctx_1h_r
             ctx_4h, ctx_4h_r = up_ctx_4h, up_ctx_4h_r
@@ -421,7 +462,6 @@ def analyze_symbol(symbol):
             ctx_1h, ctx_1h_r = dn_ctx_1h, dn_ctx_1h_r
             ctx_4h, ctx_4h_r = dn_ctx_4h, dn_ctx_4h_r
             ctx_dir = "DOWN-ish"
-
         trg_score = max(up_trg, dn_trg)
         trg_reasons = up_trg_r if up_trg >= dn_trg else dn_trg_r
 
@@ -433,7 +473,6 @@ def analyze_symbol(symbol):
     if total_score >= ALERT3_SCORE:
         alert = 3
 
-    # HARD filters
     if alert == 3 and len(trg_reasons) < MIN_TRIGGER_REASONS_FOR_ALERT3:
         alert = 2
     if alert == 3 and trg_score < MIN_TRIGGER_SCORE_FOR_ALERT3:
@@ -442,7 +481,7 @@ def analyze_symbol(symbol):
         alert = 2
 
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
-    tf_public = {k: {kk: vv for kk, vv in v.items() if kk != "close_series"} for k, v in tf_snaps.items()}
+    tf_public = {k: {kk: vv for kk, vv in v.items() if kk not in ("close_series","high_series","low_series")} for k, v in tf_snaps.items()}
 
     reasons = []
     reasons += [f"Context scored as: {ctx_dir}"]
@@ -468,45 +507,30 @@ def analyze_symbol(symbol):
         "oi_change_pct": oi_change_pct
     }
 
-
-# ---------- ANTI-SPAM / GATING ---------- #
+# ---------- AUTO PUSH GATING (same logic as before, minimal) ---------- #
 
 def allowed_to_send(report):
-    """
-    AUTO push gating — LIVE MODE anti-spam.
-    Sends ONLY when alert==3, and ONLY when it is a NEW event (edge),
-    on a NEW 15m candle, with real price movement + cooldown.
-    """
     symbol = report["symbol"]
     direction = report["direction"]
     alert = report["alert"]
     now = time.time()
 
-    # 0) Auto push ONLY for ALERT 3
     if alert != 3:
         return False
 
     key = (symbol, direction)
     last_sent = _last_sent.get(key)
     last_level = _last_alert_level.get(key, 0)
-
     candle_ot = report["tf"]["15m"]["open_time"]
     last_candle_for_symbol = _last_15m_candle.get(symbol)
 
-    # 1) Only once per NEW 15m candle (no re-sending inside the same 15m bar)
     if last_candle_for_symbol is not None and candle_ot == last_candle_for_symbol:
         return False
-
-    # 2) Rising-edge only: allow only if last_level < 3 (new ALERT 3 event)
-    # This prevents spam like 3->2->3 within ranges.
     if last_level >= 3:
         return False
-
-    # 3) Cooldown (extra safety): if we've sent recently for this symbol+direction, block
     if last_sent is not None and (now - last_sent) < COOLDOWN_ALERT3:
         return False
 
-    # 4) Require REAL price movement since last sent ALERT 3 for this symbol
     last_price = _last_alert_price.get(symbol)
     curr_price = report["tf"]["15m"]["price"]
     if last_price is not None and last_price > 0:
@@ -517,20 +541,15 @@ def allowed_to_send(report):
 
     return True
 
-
 def mark_sent(report):
     symbol = report["symbol"]
     direction = report["direction"]
     alert = report["alert"]
     candle_ot = report["tf"]["15m"]["open_time"]
-
     _last_sent[(symbol, direction)] = time.time()
     _last_alert_level[(symbol, direction)] = alert
     _last_15m_candle[symbol] = candle_ot
-
-    # NEW: store last price for anti-spam price-move gate
     _last_alert_price[symbol] = report["tf"]["15m"]["price"]
-
 
 # ---------- MESSAGE FORMAT ---------- #
 
@@ -544,23 +563,20 @@ def fmt_num(x, digits=2):
 
 def build_message(reports, title="MOMENTUM FILTER REPORT"):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"📊 *{title}*\nUTC: `{ts}`\n"
-    msg += "_(Scanner only — not a signal. Use as input for analysis.)_\n\n"
+    msg = f"📊 *{title}*\nUTC: `{ts}`\n_(Scanner only — not a signal. Use as input for analysis.)_\n\n"
 
     for r in reports:
         sym = r["symbol"]
         alert = r["alert"]
         direction = r["direction"]
         total = r["total_score"]
-        up_trg = r["up_trg"]
-        dn_trg = r["dn_trg"]
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
 
         msg += (
             f"*{sym}*  |  *ALERT {alert}*  |  *DIR (15m): {direction}*  |  "
             f"total `{total}` (ctx1h `{r['ctx_1h']}` + ctx4h `{r['ctx_4h']}` + trg `{r['trg_score']}`)\n"
-            f"Triggers: UP `{up_trg}` / DOWN `{dn_trg}`\n"
+            f"Triggers: UP `{r['up_trg']}` / DOWN `{r['dn_trg']}`\n"
         )
 
         msg += (
@@ -596,18 +612,15 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
 def build_context_compact(reports, title="MARKET CONTEXT (compact)"):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     msg = f"🧭 *{title}*\nUTC: `{ts}`\n_(Compact context — no signal.)_\n\n"
-
     for r in reports:
         sym = r["symbol"]
-        alert = r["alert"]
         direction = r["direction"]
         deriv = r["deriv"]
         oi_chg = r["oi_change_pct"]
-
         t1h = r["tf"]["1h"]
         t15 = r["tf"]["15m"]
 
-        msg += f"*{sym}* | ALERT `{alert}` | DIR `{direction}`\n"
+        msg += f"*{sym}* | ALERT `{r['alert']}` | DIR `{direction}`\n"
         msg += (
             f"Deriv: mark `{fmt_num(deriv['mark'],2)}` | funding `{fmt_num(deriv['funding'],4)}%` | "
             f"basis `{fmt_num(deriv['basis'],4)}%` | OI `{fmt_num(deriv['oi'],0)}`"
@@ -625,15 +638,12 @@ def build_context_compact(reports, title="MARKET CONTEXT (compact)"):
             f"RSI `{fmt_num(t15['rsi'],1)}`({fmt_num(t15['rsi_slp'],1)}) | VOLx `{fmt_num(t15['vol_ratio'],2)}` | ret `{fmt_num(r['returns']['15m'],2)}%`\n"
         )
         msg += "\n"
-
     return msg.strip()
-
 
 # ---------- MANUAL COMMAND HANDLER ---------- #
 
 def handle_telegram_commands():
     global _last_update_id
-
     if not TELEGRAM_TOKEN:
         return
 
@@ -647,17 +657,15 @@ def handle_telegram_commands():
         chat = msg.get("chat") or {}
         chat_id = str(chat.get("id", ""))
         text = (msg.get("text") or "").strip()
-
         if not text:
             continue
-
         if TELEGRAM_CHAT_ID and not is_allowed_chat(chat_id):
             continue
 
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "Auto: ONLY ALERT 3 (real momentum).\n"
+                "v4.4 incremental klines: 1h/4h not re-downloaded each scan.\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
@@ -681,7 +689,6 @@ def handle_telegram_commands():
                 send_telegram(f"❌ Manual report error:\n`{e}`", chat_id=chat_id)
             continue
 
-
 # ---------- MAIN SCAN (AUTO PUSH) ---------- #
 
 def run_once():
@@ -697,11 +704,9 @@ def run_once():
     if not triggered:
         return
 
-    # 1) FULL report per triggered symbol (prevents Telegram length issues)
     for r in triggered:
         send_telegram(build_message([r], title=f"🚨 ALERT 3 (FULL) — {r['symbol']}"))
 
-    # 2) Compact context for the rest
     trig_set = {x["symbol"] for x in triggered}
     others = [r for r in reports if r["symbol"] not in trig_set]
     if others:
@@ -710,7 +715,6 @@ def run_once():
     for r in triggered:
         mark_sent(r)
 
-
 # ---------- RUNNER ---------- #
 
 if __name__ == "__main__":
@@ -718,9 +722,10 @@ if __name__ == "__main__":
         telegram_delete_webhook()
         send_telegram(
             "✅ Momentum Filter bot is ONLINE.\n"
-            "Auto-push: ONLY ALERT 3 (REAL momentum).\n"
+            "v4.4: Incremental klines + rate limiter/backoff.\n"
+            "Auto: ONLY ALERT 3.\n"
             "Manual: /report or /report ETHUSDT.\n"
-            "Commands respond fast; scan runs every 5 min."
+            "Scan runs every 5 min."
         )
 
     last_scan = 0
@@ -728,15 +733,11 @@ if __name__ == "__main__":
     while True:
         try:
             handle_telegram_commands()
-
             now = time.time()
             if now - last_scan >= SCAN_SECONDS:
                 run_once()
                 last_scan = now
-
         except Exception as e:
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
-
         time.sleep(CMD_POLL_SECONDS)
-
