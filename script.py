@@ -480,6 +480,13 @@ def analyze_symbol(symbol):
     if alert == 3 and BLOCK_ALERT3_IF_DIR_MIX and direction == "MIX":
         alert = 2
 
+    # v4.5 HARD: ALERT 3 must have real 15m aggression
+    REQUIRE_VOLX_FOR_ALERT3 = 1.15
+    if alert == 3:
+        volx_15m = tf_snaps["15m"]["vol_ratio"]
+        if volx_15m < REQUIRE_VOLX_FOR_ALERT3:
+            alert = 2
+
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
     tf_public = {k: {kk: vv for kk, vv in v.items() if kk not in ("close_series","high_series","low_series")} for k, v in tf_snaps.items()}
 
@@ -741,3 +748,4 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
         time.sleep(CMD_POLL_SECONDS)
+
