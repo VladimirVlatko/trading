@@ -1,5 +1,5 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.5 (FINAL)
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v4.6 (FINAL)
 GOAL:
 - Bot runs continuously, BUT notifies you ONLY when there is a REAL momentum moment.
 - No trade signals. Scanner only (input for deeper analysis).
@@ -13,6 +13,13 @@ FINAL rules:
   4) HARD: 15m VOLx must be >= 1.15 (real aggression NOW)
 - Incremental klines (fetch last 2 candles only each scan)
 - Soft rate limiter + backoff (protect vs Binance rate-limits/blocks)
+
+v4.6 additions (analysis quality):
+- RANGE snapshot:
+  • 4h Low/High (last 24h) = last 6 candles of 4h
+  • 1h Low/High (last 6h)  = last 6 candles of 1h
+- DELTA (15m): buy vol vs sell vol using kline takerBuyBaseAssetVolume (col 9)
+- ALERT META: First alert in this move / Repeat (n)
 """
 
 import os
@@ -76,6 +83,9 @@ KLINE_SEED_LIMIT = 220
 KLINE_MIN_BARS = 120
 KLINE_TAIL_FETCH = 2
 
+# ---- NEW: meta windows ----
+MOVE_WINDOW_SEC = 2 * 60 * 60  # 2h window to count repeats
+
 # ============================================ #
 
 _last_sent = {}
@@ -83,6 +93,9 @@ _last_alert_level = {}
 _last_15m_candle = {}
 _prev_oi = {}
 _last_update_id = 0
+
+# NEW: alert meta tracking (repeat counting)
+_last_alert3_meta = {}  # symbol -> {"ts": float, "dir": str, "repeat": int}
 
 _KLINE_CACHE = {}     # (symbol, tf) -> np.array of klines float
 _DERIV_CACHE = {}     # symbol -> (ts, deriv_dict)
@@ -329,6 +342,13 @@ def tf_snapshot(k, tf_name):
     vol_ratio = vol[-1] / (np.mean(vol[-VOL_LOOKBACK:]) + 1e-12) if len(vol) >= VOL_LOOKBACK else 1.0
     open_time = int(k[-1, 0])
 
+    # NEW: taker buy volume is column 9 in Binance kline array:
+    # [0 openTime,1 open,2 high,3 low,4 close,5 volume,6 closeTime,7 quoteVol,8 trades,9 takerBuyBaseVol,10 takerBuyQuoteVol,11 ignore]
+    taker_buy = float(k[-1, 9]) if k.shape[1] > 9 else float("nan")
+    total_vol = float(vol[-1])
+    taker_sell = total_vol - taker_buy if not np.isnan(taker_buy) else float("nan")
+    delta = (taker_buy - taker_sell) if (not np.isnan(taker_buy)) else float("nan")
+
     return {
         "tf": tf_name,
         "open_time": open_time,
@@ -341,6 +361,10 @@ def tf_snapshot(k, tf_name):
         "rsi_slp": float(rsi_slp),
         "atr": float(atr_v[-1]) if not np.isnan(atr_v[-1]) else float(np.nan),
         "vol_ratio": float(vol_ratio),
+        "vol_total": float(total_vol),
+        "vol_buy": float(taker_buy) if not np.isnan(taker_buy) else None,
+        "vol_sell": float(taker_sell) if not np.isnan(taker_buy) else None,
+        "vol_delta": float(delta) if not np.isnan(taker_buy) else None,
         "close_series": close
     }
 
@@ -410,12 +434,50 @@ def choose_direction_from_15m(up_trg, dn_trg):
         return "MIX"
     return "UP" if diff > 0 else "DOWN"
 
+# ---------- NEW: RANGE helpers ---------- #
+
+def range_snapshot_from_klines(k, candles: int):
+    """
+    Returns (low, high) for the last N candles.
+    k columns: high at [2], low at [3]
+    """
+    if k is None or len(k) < candles:
+        return None, None
+    tail = k[-candles:]
+    lo = float(np.min(tail[:, 3]))
+    hi = float(np.max(tail[:, 2]))
+    return lo, hi
+
+# ---------- NEW: ALERT meta ---------- #
+
+def alert_meta_for(symbol: str, direction: str, alert_level: int):
+    """
+    Tracks repeats of ALERT 3 for a symbol within MOVE_WINDOW_SEC and same direction.
+    """
+    if alert_level != 3:
+        return {"first_or_repeat": None, "repeat_n": None}
+
+    now = time.time()
+    prev = _last_alert3_meta.get(symbol)
+
+    if (prev is None) or (now - prev["ts"] > MOVE_WINDOW_SEC) or (prev["dir"] != direction):
+        meta = {"ts": now, "dir": direction, "repeat": 1}
+        _last_alert3_meta[symbol] = meta
+        return {"first_or_repeat": "First", "repeat_n": 1}
+
+    prev["ts"] = now
+    prev["repeat"] += 1
+    _last_alert3_meta[symbol] = prev
+    return {"first_or_repeat": "Repeat", "repeat_n": prev["repeat"]}
+
 # ---------- ANALYSIS ---------- #
 
 def analyze_symbol(symbol):
     tf_snaps = {}
+    klines = {}
     for tf in TIMEFRAMES.keys():
         k = get_klines_cached(symbol, tf)
+        klines[tf] = k
         tf_snaps[tf] = tf_snapshot(k, tf)
 
     returns = compute_returns(tf_snaps)
@@ -477,6 +539,13 @@ def analyze_symbol(symbol):
         if volx_15m < REQUIRE_VOLX_FOR_ALERT3:
             alert = 2
 
+    # NEW: range snapshots
+    lo_4h_24h, hi_4h_24h = range_snapshot_from_klines(klines["4h"], candles=6)  # 6*4h = 24h
+    lo_1h_6h,  hi_1h_6h  = range_snapshot_from_klines(klines["1h"], candles=6)  # 6*1h = 6h
+
+    # NEW: alert meta (first/repeat) only meaningful for alert 3
+    meta = alert_meta_for(symbol, direction, alert)
+
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
     tf_public = {k: {kk: vv for kk, vv in v.items() if kk != "close_series"} for k, v in tf_snaps.items()}
 
@@ -501,7 +570,11 @@ def analyze_symbol(symbol):
         "returns": returns,
         "trend_labels": trend_labels,
         "deriv": deriv,
-        "oi_change_pct": oi_change_pct
+        "oi_change_pct": oi_change_pct,
+        # NEW payload fields
+        "range_4h_24h": {"low": lo_4h_24h, "high": hi_4h_24h},
+        "range_1h_6h": {"low": lo_1h_6h, "high": hi_1h_6h},
+        "alert_meta": meta
     }
 
 # ---------- ANTI-SPAM / GATING ---------- #
@@ -590,6 +663,27 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
             msg += f" | OIΔ `{fmt_num(oi_chg, 2)}%`"
         msg += "\n"
 
+        # NEW: Range snapshots
+        r4 = r.get("range_4h_24h", {})
+        r1 = r.get("range_1h_6h", {})
+        msg += (
+            f"RANGE: 4h(24h) low `{fmt_num(r4.get('low'),2)}` / high `{fmt_num(r4.get('high'),2)}`  |  "
+            f"1h(6h) low `{fmt_num(r1.get('low'),2)}` / high `{fmt_num(r1.get('high'),2)}`\n"
+        )
+
+        # NEW: Delta meta (15m)
+        t15 = r["tf"]["15m"]
+        if t15.get("vol_buy") is not None:
+            msg += (
+                f"DELTA(15m): buy `{fmt_num(t15['vol_buy'],2)}` | sell `{fmt_num(t15['vol_sell'],2)}` | "
+                f"Δ `{fmt_num(t15['vol_delta'],2)}`\n"
+            )
+
+        # NEW: Alert meta
+        meta = r.get("alert_meta", {})
+        if meta and meta.get("first_or_repeat"):
+            msg += f"ALERT META: {meta['first_or_repeat']} (`{meta['repeat_n']}`)\n"
+
         for tf in ["4h", "1h", "15m"]:
             t = r["tf"][tf]
             lbl = r["trend_labels"][tf]
@@ -634,6 +728,18 @@ def build_context_compact(reports, title="MARKET CONTEXT (compact)"):
             msg += f" | OIΔ `{fmt_num(oi_chg,2)}%`"
         msg += "\n"
 
+        # Range snapshots (compact)
+        r4 = r.get("range_4h_24h", {})
+        r1 = r.get("range_1h_6h", {})
+        msg += (
+            f"RANGE: 4h(24h) `{fmt_num(r4.get('low'),2)}`-`{fmt_num(r4.get('high'),2)}` | "
+            f"1h(6h) `{fmt_num(r1.get('low'),2)}`-`{fmt_num(r1.get('high'),2)}`\n"
+        )
+
+        # Delta (compact)
+        if t15.get("vol_buy") is not None:
+            msg += f"DELTA(15m): buy `{fmt_num(t15['vol_buy'],2)}` | sell `{fmt_num(t15['vol_sell'],2)}` | Δ `{fmt_num(t15['vol_delta'],2)}`\n"
+
         msg += (
             f"`1h` p `{fmt_num(t1h['price'],2)}` | EMA20 `{fmt_num(t1h['ema20'],2)}` | EMA50 `{fmt_num(t1h['ema50'],2)}` | "
             f"RSI `{fmt_num(t1h['rsi'],1)}`({fmt_num(t1h['rsi_slp'],1)}) | VOLx `{fmt_num(t1h['vol_ratio'],2)}` | ret `{fmt_num(r['returns']['1h'],2)}%`\n"
@@ -671,7 +777,7 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v4.5 FINAL: incremental klines + rate limiter + VOLx hard filter for ALERT 3.\n"
+                "v4.6 FINAL: range snapshot + delta(15m) buy/sell + alert meta.\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
@@ -728,7 +834,8 @@ if __name__ == "__main__":
         telegram_delete_webhook()
         send_telegram(
             "✅ Momentum Filter bot is ONLINE.\n"
-            "v4.5 FINAL: incremental klines + rate limiter/backoff + VOLx hard filter.\n"
+            "v4.6 FINAL: incremental klines + rate limiter/backoff + VOLx hard filter.\n"
+            "Additions: range snapshot + delta(15m) + alert meta.\n"
             "Auto: ONLY ALERT 3.\n"
             "Manual: /report or /report ETHUSDT.\n"
             "Scan runs every 5 min."
@@ -746,4 +853,3 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
         time.sleep(CMD_POLL_SECONDS)
-
