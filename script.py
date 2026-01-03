@@ -207,11 +207,23 @@ def send_telegram(message: str, chat_id: str | None = None):
     target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
     if not target:
         return
+
     if message and len(message) > 3900:
         message = message[:3900] + "\n…(truncated)"
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": target, "text": message, "parse_mode": "Markdown"}
-    http_post_json(url, payload, timeout=10)
+    payload = {
+        "chat_id": str(target),
+        "text": message,
+        # "parse_mode": "Markdown",   # <-- ИЗБРИШИ / исклучи
+        "disable_web_page_preview": True
+    }
+    resp = requests.post(url, json=payload, timeout=10)
+
+    # ако пак фрли, да видиш точна причина
+    if resp.status_code >= 400:
+        raise Exception(f"Telegram error {resp.status_code}: {resp.text[:500]}")
+
 
 def telegram_delete_webhook():
     if not TELEGRAM_TOKEN:
@@ -1055,3 +1067,4 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ *Runtime error*\n`{e}`")
         time.sleep(CMD_POLL_SECONDS)
+
