@@ -1,20 +1,21 @@
 """
-MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v5.0 (EARLY+CONFIRM)
+MOMENTUM PRO – FILTER (Telegram Enabled, SAFE) — v5.1 (EARLY+CONFIRM, STRUCTURE-AWARE)
 GOAL:
 - Bot runs continuously, NOT a trade signal. Scanner only.
 - Alerts earlier (start of move) + still supports confirmation.
+- Target: alert around the “15–20% of move” zone (early-but-real), not 0–5% noise and not 50–80% chase.
 
-Key upgrades vs v4.6:
-1) FIXED bug: ALERT3 no longer gets permanently blocked after first send.
-2) Two-tier ALERT3:
-   - ALERT3 (SCOUT): earlier, catches the START (VOLx >= 1.05)
-   - ALERT3 (CONFIRM): stronger continuation confirmation (VOLx >= 1.15)
-3) Late-filter: blocks alerts when price is already too far from EMA20 (in ATR units) → reduces "after the move" alerts.
-4) Faster scan loop: default every 60s (you can change).
-5) Cooldown logic:
-   - Scout cooldown shorter
-   - Confirm can override Scout (upgrade) even if Scout was recently sent.
-6) Keeps: incremental klines, rate limiter/backoff, range snapshot, delta(15m), alert meta.
+What’s new vs v5.0:
+1) 15m STRUCTURE filter (breakout / breakdown OR reclaim) to avoid chop alerts near EMA without real move.
+2) “Early zone” distance band in ATR units:
+   - SCOUT: requires |p-EMA20| between MIN and MAX (default 0.25–0.75 ATR)
+   - CONFIRM: slightly wider (default 0.25–1.00 ATR)
+   - HARD late block remains at 1.25 ATR
+3) Aggression upgrade:
+   - Uses VOLx + DELTA dominance (dynamic threshold vs rolling median abs delta)
+   - Optional body/ATR impulse check (real candle intent)
+4) Soft late logic:
+   - If > SOFT_LATE_ATR (0.90) then allow only if breakout/breakdown happened (prevents “after drift” alerts).
 
 NOTES:
 - Still no trade signals. Use as input for analysis.
@@ -61,6 +62,20 @@ VOLX_CONFIRM = 1.15   # stronger confirmation
 
 # Late filter (prevents "after it already ripped" alerts)
 LATE_ATR_BLOCK = 1.25  # block if |price-EMA20| >= this * ATR (tune 1.1–1.5)
+SOFT_LATE_ATR = 0.90   # beyond this, require STRUCTURE break (reduces drift/late-chop)
+
+# "Early zone" band (targets your 15–20% of move feel)
+EARLY_MIN_ATR = 0.25
+EARLY_MAX_SCOUT_ATR = 0.75
+EARLY_MAX_CONFIRM_ATR = 1.00
+
+# Structure / breakout window (15m)
+SWING_LOOKBACK = 5  # last N candles (excluding current) to define swing high/low
+
+# Aggression / intent
+DELTA_MED_LOOKBACK = 20
+DELTA_DOM_MULT = 1.20       # abs(delta_now) >= 1.2 * median(abs(delta_lastN))
+BODY_ATR_MIN = 0.40         # abs(body) >= 0.40 * ATR = "intent candle"
 
 # Anti-spam / cadence
 MOVE_WINDOW_SEC = 2 * 60 * 60  # 2h window to count repeats / treat as same move
@@ -332,6 +347,9 @@ def fetch_derivatives_cached(symbol):
 # ---------- SNAPSHOT ---------- #
 
 def tf_snapshot(k, tf_name):
+    # Binance kline columns:
+    # 0 open_time, 1 open, 2 high, 3 low, 4 close, 5 volume, 9 taker_buy_base_asset_volume
+    op = k[:, 1]
     close = k[:, 4]
     high = k[:, 2]
     low = k[:, 3]
@@ -350,15 +368,32 @@ def tf_snapshot(k, tf_name):
     vol_ratio = vol[-1] / (np.mean(vol[-VOL_LOOKBACK:]) + 1e-12) if len(vol) >= VOL_LOOKBACK else 1.0
     open_time = int(k[-1, 0])
 
-    # Binance kline: taker buy volume is col 9
-    taker_buy = float(k[-1, 9]) if k.shape[1] > 9 else float("nan")
-    total_vol = float(vol[-1])
-    taker_sell = total_vol - taker_buy if not np.isnan(taker_buy) else float("nan")
-    delta = (taker_buy - taker_sell) if (not np.isnan(taker_buy)) else float("nan")
+    # Delta series
+    if k.shape[1] > 9:
+        taker_buy_series = k[:, 9].astype(float)
+        total_vol_series = vol.astype(float)
+        taker_sell_series = total_vol_series - taker_buy_series
+        delta_series = taker_buy_series - taker_sell_series
+        taker_buy = float(taker_buy_series[-1])
+        total_vol = float(total_vol_series[-1])
+        taker_sell = float(taker_sell_series[-1])
+        delta_now = float(delta_series[-1])
+    else:
+        taker_buy_series = None
+        delta_series = None
+        taker_buy = float("nan")
+        total_vol = float(vol[-1])
+        taker_sell = float("nan")
+        delta_now = float("nan")
+
+    body = float(close[-1] - op[-1])
 
     return {
         "tf": tf_name,
         "open_time": open_time,
+        "open": float(op[-1]),
+        "high": float(high[-1]),
+        "low": float(low[-1]),
         "price": float(close[-1]),
         "ema20": float(e20[-1]),
         "ema50": float(e50[-1]),
@@ -371,8 +406,12 @@ def tf_snapshot(k, tf_name):
         "vol_total": float(total_vol),
         "vol_buy": float(taker_buy) if not np.isnan(taker_buy) else None,
         "vol_sell": float(taker_sell) if not np.isnan(taker_buy) else None,
-        "vol_delta": float(delta) if not np.isnan(taker_buy) else None,
-        "close_series": close
+        "vol_delta": float(delta_now) if not np.isnan(taker_buy) else None,
+        "delta_series": delta_series,         # NEW
+        "body": body,                         # NEW
+        "close_series": close,                # existing
+        "high_series": high,                  # NEW (for structure)
+        "low_series": low,                    # NEW (for structure)
     }
 
 def tf_trend_label(snap):
@@ -410,64 +449,144 @@ def regime_score(tf_snap, direction):
         if rsi <= 48: score += 1; reasons.append("HTF RSI weak")
     return score, reasons
 
+def _structure_flags_15m(tf15, direction):
+    """
+    STRUCTURE detection for 15m:
+    - Breakout: close > max(high[-SWING_LOOKBACK-1:-1])
+    - Breakdown: close < min(low[-SWING_LOOKBACK-1:-1])
+    - Reclaim: prev_close <= EMA20 and now_close > EMA20 (and preferably > EMA50)
+    - Breakdown reclaim for shorts analog.
+    """
+    close = tf15["close_series"]
+    high = tf15["high_series"]
+    low = tf15["low_series"]
+    e20 = tf15["ema20"]
+    e50 = tf15["ema50"]
+
+    if len(close) < SWING_LOOKBACK + 3:
+        return {"break": False, "reclaim": False, "level": None}
+
+    prev_close = float(close[-2])
+    now_close = float(close[-1])
+
+    # swing levels from prior candles only (exclude current candle)
+    swing_hi = float(np.max(high[-(SWING_LOOKBACK+1):-1]))
+    swing_lo = float(np.min(low[-(SWING_LOOKBACK+1):-1]))
+
+    if direction == "UP":
+        breakout = now_close > swing_hi
+        reclaim = (prev_close <= e20 and now_close > e20)
+        # (optional) stronger reclaim: above e50
+        if reclaim and now_close > e50:
+            reclaim = True
+        return {"break": breakout, "reclaim": reclaim, "level": swing_hi}
+    else:
+        breakdown = now_close < swing_lo
+        reclaim = (prev_close >= e20 and now_close < e20)
+        if reclaim and now_close < e50:
+            reclaim = True
+        return {"break": breakdown, "reclaim": reclaim, "level": swing_lo}
+
+def _delta_dominance(tf15):
+    ds = tf15.get("delta_series")
+    dn = tf15.get("vol_delta")
+    if ds is None or dn is None:
+        return False, "delta n/a"
+
+    # use last N *completed-ish* candles including current (good enough for scanner)
+    tail = ds[-DELTA_MED_LOOKBACK:] if len(ds) >= DELTA_MED_LOOKBACK else ds
+    med = float(np.median(np.abs(tail))) + 1e-12
+    ok = abs(float(dn)) >= (DELTA_DOM_MULT * med)
+    return ok, f"Δdom {abs(float(dn)):.0f} >= {DELTA_DOM_MULT:.2f}*med({med:.0f})"
+
 def trigger_score_15m(tf15, direction, ret_15m):
     """
-    Early+Confirm trigger logic.
-    - Uses RSI reclaim/push + slope
-    - Uses volume uptick/expansion
-    - Blocks "late" alerts when price is far from EMA20 in ATR units
+    v5.1 Early+Confirm trigger logic:
+    - STRUCTURE-aware (breakout/breakdown OR reclaim required for ALERT3 tiers)
+    - Early-zone ATR band to hit your “15–20% of move” window
+    - Aggression: VOLx + delta dominance + body/ATR intent
+    - Late filters: hard block + soft late requires structure
     """
     price, e20, e50 = tf15["price"], tf15["ema20"], tf15["ema50"]
     rsi, rsi_slp, vol_ratio = tf15["rsi"], tf15["rsi_slp"], tf15["vol_ratio"]
     atr = tf15["atr"]
+    body = tf15.get("body", 0.0)
 
-    # Late filter: if move already stretched, don't pretend it's a "fresh momentum moment"
+    # --- ATR distance ---
     dist_atr = atr_distance(price, e20, atr)
+
+    # HARD late block
     if dist_atr >= LATE_ATR_BLOCK:
         return 0, [f"Blocked as late: |p-EMA20| {dist_atr:.2f} ATR >= {LATE_ATR_BLOCK:.2f}"]
+
+    # STRUCTURE flags
+    st = _structure_flags_15m(tf15, direction)
+    has_structure = bool(st["break"] or st["reclaim"])
+
+    # SOFT late: beyond 0.90 ATR require breakout/breakdown (avoid drifting extensions)
+    if dist_atr >= SOFT_LATE_ATR and not st["break"]:
+        return 0, [f"Soft-late block: dist {dist_atr:.2f} ATR >= {SOFT_LATE_ATR:.2f} without break"]
+
+    # Candle intent (body vs ATR)
+    intent = False
+    if atr and not (isinstance(atr, float) and np.isnan(atr)) and atr > 0:
+        intent = abs(float(body)) >= (BODY_ATR_MIN * float(atr))
+
+    # Delta dominance
+    d_ok, d_msg = _delta_dominance(tf15)
 
     score = 0
     reasons = []
 
+    # price/EMA structure
     if direction == "UP":
-        # price structure
         if price > e20: score += 1; reasons.append("15m price above EMA20")
         if price > e20 and price > e50: score += 1; reasons.append("15m price above EMA20/50")
-
-        # EARLY momentum (start): RSI reclaim + slope
         if rsi >= 55: score += 1; reasons.append("15m RSI reclaim (>=55)")
         if rsi >= 60: score += 1; reasons.append("15m RSI push (>=60)")
         if rsi_slp >= 2: score += 1; reasons.append("15m RSI rising")
 
-        # volume: uptick first, then expansion
         if vol_ratio >= VOLX_SCOUT: score += 1; reasons.append(f"15m volume uptick ({vol_ratio:.2f}x)")
         if vol_ratio >= VOLX_CONFIRM: score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
 
-        # return (keep modest)
         if ret_15m >= 0.10: score += 1; reasons.append(f"15m return positive ({ret_15m:+.2f}%)")
 
-        # aggression combo: early still possible, but don't require RSI > 70
-        if vol_ratio >= VOLX_CONFIRM and rsi_slp >= 4: score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
-
     else:
-        # price structure
         if price < e20: score += 1; reasons.append("15m price below EMA20")
         if price < e20 and price < e50: score += 1; reasons.append("15m price below EMA20/50")
-
-        # EARLY momentum (start): RSI break down + slope
         if rsi <= 45: score += 1; reasons.append("15m RSI break (<=45)")
         if rsi <= 40: score += 1; reasons.append("15m RSI push (<=40)")
         if rsi_slp <= -2: score += 1; reasons.append("15m RSI falling")
 
-        # volume
         if vol_ratio >= VOLX_SCOUT: score += 1; reasons.append(f"15m volume uptick ({vol_ratio:.2f}x)")
         if vol_ratio >= VOLX_CONFIRM: score += 1; reasons.append(f"15m volume expansion ({vol_ratio:.2f}x)")
 
-        # return
         if ret_15m <= -0.10: score += 1; reasons.append(f"15m return negative ({ret_15m:+.2f}%)")
 
-        # aggression combo
-        if vol_ratio >= VOLX_CONFIRM and rsi_slp <= -4: score += 1; reasons.append("15m aggression combo (vol + RSI slope)")
+    # STRUCTURE requirement is not a "score point" only; but we count it to reasons
+    if has_structure:
+        if st["break"]:
+            reasons.append(f"STRUCTURE: break level ({st['level']:.2f})")
+            score += 1
+        elif st["reclaim"]:
+            reasons.append("STRUCTURE: reclaim EMA20")
+            score += 1
+    else:
+        reasons.append("No structure (no break/reclaim)")
+
+    # Aggression extras
+    if d_ok:
+        score += 1
+        reasons.append(f"DELTA dominance ({d_msg})")
+    else:
+        reasons.append(f"Delta not dominant ({d_msg})")
+
+    if intent:
+        score += 1
+        reasons.append(f"Intent candle: |body| >= {BODY_ATR_MIN:.2f}*ATR")
+
+    # Early-zone note (not just late block — we want *start* area)
+    reasons.append(f"ATR dist: {dist_atr:.2f} (target early zone {EARLY_MIN_ATR:.2f}–{EARLY_MAX_SCOUT_ATR:.2f}/{EARLY_MAX_CONFIRM_ATR:.2f})")
 
     return score, reasons
 
@@ -570,15 +689,34 @@ def analyze_symbol(symbol):
     if alert == 3 and BLOCK_ALERT3_IF_DIR_MIX and direction == "MIX":
         alert = 2
 
-    # Determine tier for alert 3 (SCOUT vs CONFIRM)
+    # Determine tier for alert 3 (SCOUT vs CONFIRM) + EARLY-ZONE band per tier
     tier = None
     if alert == 3:
-        volx_15m = tf_snaps["15m"]["vol_ratio"]
-        tier = "CONFIRM" if volx_15m >= VOLX_CONFIRM else "SCOUT"
-        # For SCOUT, require at least VOLX_SCOUT
-        if volx_15m < VOLX_SCOUT:
+        t15 = tf_snaps["15m"]
+        volx_15m = t15["vol_ratio"]
+        atr = t15["atr"]
+        dist_atr = atr_distance(t15["price"], t15["ema20"], atr)
+
+        # Early-zone gating (this is your “15–20%” behavior)
+        if dist_atr < EARLY_MIN_ATR:
             alert = 2
             tier = None
+        else:
+            # Tier by volx
+            tier = "CONFIRM" if volx_15m >= VOLX_CONFIRM else "SCOUT"
+
+            # Tier requires its minimum volx
+            if tier == "SCOUT" and volx_15m < VOLX_SCOUT:
+                alert = 2
+                tier = None
+
+            # Tier max distance (avoid chase)
+            if tier == "SCOUT" and dist_atr > EARLY_MAX_SCOUT_ATR:
+                alert = 2
+                tier = None
+            if tier == "CONFIRM" and dist_atr > EARLY_MAX_CONFIRM_ATR:
+                alert = 2
+                tier = None
 
     # range snapshots
     lo_4h_24h, hi_4h_24h = range_snapshot_from_klines(klines["4h"], candles=6)
@@ -587,7 +725,7 @@ def analyze_symbol(symbol):
     meta = alert_meta_for(symbol, direction, alert)
 
     trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
-    tf_public = {k: {kk: vv for kk, vv in v.items() if kk != "close_series"} for k, v in tf_snaps.items()}
+    tf_public = {k: {kk: vv for kk, vv in v.items() if kk not in ("close_series", "high_series", "low_series", "delta_series")} for k, v in tf_snaps.items()}
 
     reasons = []
     reasons += [f"Context scored as: {ctx_dir}"]
@@ -595,7 +733,7 @@ def analyze_symbol(symbol):
     reasons += ["Setup (4h):"] + (ctx_4h_r if ctx_4h_r else ["(neutral)"])
     reasons += ["Trigger (15m):"] + (trg_reasons if trg_reasons else ["(no strong 15m trigger yet)"])
     if alert == 3 and tier:
-        reasons += [f"Tier: {tier} (VOLx>= {VOLX_CONFIRM:.2f} = CONFIRM, else SCOUT>= {VOLX_SCOUT:.2f})"]
+        reasons += [f"Tier: {tier} (SCOUT: VOLx≥{VOLX_SCOUT:.2f}, dist≤{EARLY_MAX_SCOUT_ATR:.2f}ATR | CONFIRM: VOLx≥{VOLX_CONFIRM:.2f}, dist≤{EARLY_MAX_CONFIRM_ATR:.2f}ATR)"]
 
     return {
         "symbol": symbol,
@@ -627,7 +765,7 @@ def allowed_to_send(report):
     - Only ALERT3 pushes.
     - One per new 15m candle.
     - Scout has shorter cooldown; Confirm has longer cooldown.
-    - Confirm can override Scout (upgrade) even if Scout was sent recently.
+    - Confirm can override Scout (upgrade) even if Scout was recently sent.
     - Requires meaningful price move vs last alert price for this symbol.
     """
     symbol = report["symbol"]
@@ -657,11 +795,9 @@ def allowed_to_send(report):
     key = (symbol, direction)
     prev = _last_sent_state.get(key)
 
-    # If no previous send for this direction: allow
     if prev is None:
         return True
 
-    # If previous is old (outside move window), allow fresh
     if now - prev["ts"] > MOVE_WINDOW_SEC:
         return True
 
@@ -669,7 +805,6 @@ def allowed_to_send(report):
     if prev.get("tier") == "SCOUT" and tier == "CONFIRM":
         return True
 
-    # Cooldown by tier
     cooldown = COOLDOWN_CONFIRM if tier == "CONFIRM" else COOLDOWN_SCOUT
     if now - prev["ts"] < cooldown:
         return False
@@ -733,7 +868,6 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
             msg += f" | OIΔ `{fmt_num(oi_chg, 2)}%`"
         msg += "\n"
 
-        # Range snapshots
         r4 = r.get("range_4h_24h", {})
         r1 = r.get("range_1h_6h", {})
         msg += (
@@ -741,7 +875,6 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
             f"1h(6h) low `{fmt_num(r1.get('low'),2)}` / high `{fmt_num(r1.get('high'),2)}`\n"
         )
 
-        # Delta meta (15m)
         t15 = r["tf"]["15m"]
         if t15.get("vol_buy") is not None:
             msg += (
@@ -749,7 +882,6 @@ def build_message(reports, title="MOMENTUM FILTER REPORT"):
                 f"Δ `{fmt_num(t15['vol_delta'],2)}`\n"
             )
 
-        # Alert meta
         meta = r.get("alert_meta", {})
         if meta and meta.get("first_or_repeat"):
             msg += f"ALERT META: {meta['first_or_repeat']} (`{meta['repeat_n']}`)\n"
@@ -846,7 +978,7 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v5.0 EARLY+CONFIRM: Scout+Confirm tiers, late-filter, faster scan.\n"
+                "v5.1 EARLY+CONFIRM: structure-aware + early-zone ATR band + delta/body aggression.\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
@@ -885,13 +1017,11 @@ def run_once():
     if not triggered:
         return
 
-    # Send each trigger as its own alert
     for r in triggered:
         tier = r.get("tier") or "ALERT3"
         send_telegram(build_message([r], title=f"🚨 ALERT 3 ({tier}) — {r['symbol']}"))
         mark_sent(r)
 
-    # Context for others
     trig_set = {x["symbol"] for x in triggered}
     others = [r for r in reports if r["symbol"] not in trig_set]
     if others:
@@ -904,10 +1034,11 @@ if __name__ == "__main__":
         telegram_delete_webhook()
         send_telegram(
             "✅ Momentum Filter bot is ONLINE.\n"
-            "v5.0 EARLY+CONFIRM:\n"
+            "v5.1 EARLY+CONFIRM (Structure-aware):\n"
             f"- Scan: every {SCAN_SECONDS}s\n"
             f"- ALERT3 tiers: SCOUT (VOLx≥{VOLX_SCOUT}) / CONFIRM (VOLx≥{VOLX_CONFIRM})\n"
-            f"- Late filter: block if |p-EMA20| ≥ {LATE_ATR_BLOCK} ATR\n"
+            f"- Early-zone band: dist≥{EARLY_MIN_ATR} ATR; SCOUT dist≤{EARLY_MAX_SCOUT_ATR} ATR; CONFIRM dist≤{EARLY_MAX_CONFIRM_ATR} ATR\n"
+            f"- Late filter: hard block if |p-EMA20| ≥ {LATE_ATR_BLOCK} ATR; soft-late {SOFT_LATE_ATR} ATR requires break\n"
             "Auto: ONLY ALERT 3 (SCOUT/CONFIRM).\n"
             "Manual: /report or /report ETHUSDT."
         )
