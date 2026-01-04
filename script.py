@@ -1,20 +1,22 @@
 """
 MOMENTUM PRO — MULTI-ALERT + DETAILED REPORT (Telegram Enabled, SAFE)
-v7.0 (REWRITE) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
+v7.1 (FIXED) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
 
 GOAL
 - Scanner only — NOT a trade signal.
 - Sharper alert logic (don’t miss good moments) + still protected from spam.
-- Manual /report output is DETAILED (old-style) so you can forward it for pro analysis.
+- /report output is DETAILED (old-style) so you can forward it for pro analysis.
+- /report (ALL) sends in MULTIPLE Telegram messages automatically (NO “…truncated” ever).
 
 NOTES
 - Binance Futures public endpoints only.
-- Telegram /report sends ONE message for ALL 3 symbols (kept under Telegram limits by compacting reasons).
+- Telegram getUpdates long-polling (stable).
+- Works in private chat and groups. If bot privacy mode is ON in groups,
+  use /report@YourBotName or disable privacy in BotFather.
 """
 
 import os
 import time
-import math
 import requests
 import numpy as np
 from datetime import datetime, UTC
@@ -23,6 +25,7 @@ from collections import deque
 # ================== CONFIG ================== #
 
 BINANCE_FUTURES = "https://fapi.binance.com"
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 TIMEFRAMES = {"15m": "15m", "1h": "1h", "4h": "4h"}
 
@@ -34,14 +37,13 @@ ATR_LEN = 14
 VOL_LOOKBACK = 20
 SLOPE_LOOKBACK = 6
 DELTA_MED_LOOKBACK = 20
-
 SWING_LOOKBACK = 5
 
 RETURN_LOOKBACK_15M = 6
 RETURN_LOOKBACK_1H = 6
 RETURN_LOOKBACK_4H = 6
 
-# --- alert thresholds (tuned to catch early but not spam) ---
+# --- alert thresholds (tuned) ---
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
 VOLX_CONFIRM = 1.10
@@ -65,7 +67,6 @@ SOFT_LATE_ATR_CONFIRM = 1.10
 
 # Scan / command loop
 SCAN_SECONDS = 60
-CMD_POLL_SECONDS = 5
 
 # Anti-spam
 COOLDOWN_SCOUT = 12 * 60
@@ -78,8 +79,9 @@ MIN_MOVE_SCOUT = {"BTCUSDT": 0.10, "ETHUSDT": 0.14, "SOLUSDT": 0.18}
 MIN_MOVE_PULLBACK = {"BTCUSDT": 0.15, "ETHUSDT": 0.20, "SOLUSDT": 0.25}
 MIN_MOVE_CONFIRM = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Telegram (strip to avoid hidden newline/space bugs)
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 # ---- rate protection ----
 REQUEST_LOG = deque(maxlen=600)
@@ -165,43 +167,67 @@ def http_get_json(url, params=None, timeout=10):
 
 # ================== TELEGRAM ================== #
 
+def is_allowed_chat(chat_id: str) -> bool:
+    # If TELEGRAM_CHAT_ID not set, allow any chat.
+    if not TELEGRAM_CHAT_ID:
+        return True
+    return str(chat_id).strip() == str(TELEGRAM_CHAT_ID).strip()
+
 def send_telegram(message: str, chat_id: str | None = None):
+    """
+    Sends message. If longer than Telegram limit, automatically splits into chunks.
+    NO truncation ever.
+    """
     if not TELEGRAM_TOKEN:
         return
-    target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
+
+    target = (str(chat_id).strip() if chat_id is not None else TELEGRAM_CHAT_ID)
     if not target or not message:
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    MAX_LEN = 3900  # safe margin under Telegram 4096 limit
+    MAX_LEN = 3900  # safe margin under Telegram 4096
 
+    # Split by lines to preserve formatting
     lines = message.split("\n")
     chunks = []
     current = ""
 
     for line in lines:
-        # +1 for the newline that will be re-added
-        if len(current) + len(line) + 1 <= MAX_LEN:
-            current += line + "\n"
+        add = line + "\n"
+        if len(current) + len(add) <= MAX_LEN:
+            current += add
         else:
-            chunks.append(current.rstrip())
-            current = line + "\n"
+            if current.strip():
+                chunks.append(current.rstrip())
+            # If a single line is too big, hard-slice it
+            if len(add) > MAX_LEN:
+                s = add
+                while len(s) > MAX_LEN:
+                    chunks.append(s[:MAX_LEN])
+                    s = s[MAX_LEN:]
+                current = s
+            else:
+                current = add
 
     if current.strip():
         chunks.append(current.rstrip())
 
+    last_err = None
     for part in chunks:
         payload = {
             "chat_id": str(target),
             "text": part,
             "disable_web_page_preview": True
         }
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=15)
         if resp.status_code >= 400:
-            raise Exception(
-                f"Telegram error {resp.status_code}: {resp.text[:500]}"
-            )
+            last_err = f"Telegram error {resp.status_code}: {resp.text[:500]}"
+            break
+
+    if last_err:
+        raise Exception(last_err)
 
 def telegram_delete_webhook():
     if not TELEGRAM_TOKEN:
@@ -209,18 +235,18 @@ def telegram_delete_webhook():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook"
     http_get_json(url, params={"drop_pending_updates": True}, timeout=10)
 
-def telegram_get_updates(offset=None, timeout=0):
+def telegram_get_updates(offset=None, timeout=20):
+    """
+    Long-polling = stable; prevents missing /report.
+    """
     if not TELEGRAM_TOKEN:
         return []
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     params = {"timeout": timeout}
     if offset is not None:
         params["offset"] = offset
-    data = http_get_json(url, params=params, timeout=10)
+    data = http_get_json(url, params=params, timeout=timeout + 5)
     return data.get("result", []) if isinstance(data, dict) else []
-
-def is_allowed_chat(chat_id: str) -> bool:
-    return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
 
 # ================== INDICATORS ================== #
@@ -427,8 +453,8 @@ def _structure_flags_15m(tf15, side):
     prev_close = float(close[-2])
     now_close = float(close[-1])
 
-    swing_hi = float(np.max(high[-(SWING_LOOKBACK+1):-1]))
-    swing_lo = float(np.min(low[-(SWING_LOOKBACK+1):-1]))
+    swing_hi = float(np.max(high[-(SWING_LOOKBACK + 1):-1]))
+    swing_lo = float(np.min(low[-(SWING_LOOKBACK + 1):-1]))
 
     if side == "LONG":
         breakout = now_close > swing_hi
@@ -462,7 +488,6 @@ def _intent_candle(tf15):
 def _ctx_score(tf_snap, side):
     """
     Returns: (score_int, reasons_list, up_count, down_count)
-    Score designed to mimic your old "ctx1h/ctx4h" style.
     """
     p = tf_snap["price"]
     e20 = tf_snap["ema20"]
@@ -498,7 +523,7 @@ def _ctx_score(tf_snap, side):
     else:
         reasons.append("HTF EMA slopes mixed")
 
-    # RSI supportive (directional nuance)
+    # RSI supportive
     if side == "LONG":
         if r >= 52:
             score += 1; up += 1; reasons.append("HTF RSI supportive")
@@ -514,8 +539,7 @@ def _ctx_score(tf_snap, side):
 
 def _trg_score(tf15, side, ret15):
     """
-    Returns trigger score like old report "trg".
-    Also returns trigger reasons + up/down counts.
+    Returns trigger score like old report "trg" + trigger reasons + up/down counts.
     """
     p = tf15["price"]
     e20 = tf15["ema20"]
@@ -552,7 +576,6 @@ def _trg_score(tf15, side, ret15):
     d_ok, d_msg = _delta_dominance(tf15)
     if d_ok:
         reasons.append(f"DELTA dominance ({d_msg})"); score += 1
-        # direction from delta sign
         dn = tf15.get("vol_delta")
         if dn is not None:
             if dn > 0: up += 1
@@ -571,7 +594,7 @@ def _trg_score(tf15, side, ret15):
     else:
         reasons.append("ret15 neutral/contra")
 
-    # Volx info (not score, but in report)
+    # Volx snapshot
     reasons.append(f"VOLx snapshot {volx:.2f}")
 
     return score, reasons, up, down
@@ -593,11 +616,11 @@ def _scout_signal(tf15, tf1h, side, ret15):
     if volx < VOLX_SCOUT:
         return None
 
-    # SCOUT: allow earlier entries
+    # SCOUT: allow earlier entries (but not totally random)
     if side == "LONG":
         if rsi1h < RSI_SCOUT_LONG:
             return None
-        if not (price > e20 or ret15 >= 0.25):  # a bit looser to avoid misses
+        if not (price > e20 or ret15 >= 0.25):
             return None
     else:
         if rsi1h > RSI_SCOUT_SHORT:
@@ -739,32 +762,22 @@ def analyze_symbol(symbol):
 
     signals = []
 
-    # Generate signals for both sides
+    # Both sides
     s_long = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "LONG", ret_15m)
-    if s_long:
-        signals.append(s_long)
-
+    if s_long: signals.append(s_long)
     s_short = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "SHORT", ret_15m)
-    if s_short:
-        signals.append(s_short)
+    if s_short: signals.append(s_short)
 
     pb_long = _pullback_signal(tf_snaps["15m"], symbol, "LONG")
-    if pb_long:
-        signals.append(pb_long)
-
+    if pb_long: signals.append(pb_long)
     pb_short = _pullback_signal(tf_snaps["15m"], symbol, "SHORT")
-    if pb_short:
-        signals.append(pb_short)
+    if pb_short: signals.append(pb_short)
 
     c_long = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "LONG", ret_15m)
-    if c_long:
-        signals.append(c_long)
-
+    if c_long: signals.append(c_long)
     c_short = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "SHORT", ret_15m)
-    if c_short:
-        signals.append(c_short)
+    if c_short: signals.append(c_short)
 
-    # Public tf snapshot (without big arrays)
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
             if kk not in ("close_series", "high_series", "low_series", "delta_series", "vol_series")}
@@ -775,7 +788,7 @@ def analyze_symbol(symbol):
         "symbol": symbol,
         "signals": signals,
         "tf": tf_public,
-        "tf_raw": tf_snaps,     # keep raw for report scoring
+        "tf_raw": tf_snaps,
         "returns": returns,
         "deriv": deriv,
         "oi_change_pct": oi_change_pct,
@@ -836,7 +849,6 @@ def mark_sent(symbol, signal, report):
     _last_15m_candle_by_key[key] = candle_ot
     _last_alert_price_by_key[key] = float(price)
 
-    # Impulse memory for pullback
     if level in ("SCOUT", "CONFIRM"):
         _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(price)}
 
@@ -876,25 +888,20 @@ def _ctx_label(up_cnt, down_cnt):
     return "MIX"
 
 def _pick_best_side_for_report(rep):
-    """
-    For manual report we show the side that has stronger context score,
-    because your old report had a single direction line.
-    """
     tf1 = rep["tf_raw"]["1h"]
     tf4 = rep["tf_raw"]["4h"]
-    # quick compare ctx (LONG vs SHORT)
+
     s1L, _, upL1, dnL1 = _ctx_score(tf1, "LONG")
     s4L, _, upL4, dnL4 = _ctx_score(tf4, "LONG")
     s1S, _, upS1, dnS1 = _ctx_score(tf1, "SHORT")
     s4S, _, upS4, dnS4 = _ctx_score(tf4, "SHORT")
 
-    totalL = s1L + s4L + (upL1+upL4) - (dnL1+dnL4)
-    totalS = s1S + s4S + (dnS1+dnS4) - (upS1+upS4)
+    totalL = s1L + s4L + (upL1 + upL4) - (dnL1 + dnL4)
+    totalS = s1S + s4S + (dnS1 + dnS4) - (upS1 + upS4)
 
     return "LONG" if totalL >= totalS else "SHORT"
 
 def _alert_level_from_total(total_score):
-    # roughly matches your old “ALERT 2/3” feel
     if total_score >= 13:
         return "ALERT 3"
     if total_score >= 10:
@@ -902,14 +909,6 @@ def _alert_level_from_total(total_score):
     return "ALERT 1"
 
 def build_report_oldstyle(rep):
-    """
-    DETAILED report like your old one:
-    - headline summary line with ctx/trg totals
-    - Deriv/RANGE/DELTA
-    - 4h/1h/15m detailed lines
-    - Why flagged (context + trigger breakdown)
-    - Signals found list (SCOUT/PULLBACK/CONFIRM)
-    """
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     sym = rep["symbol"]
 
@@ -922,7 +921,6 @@ def build_report_oldstyle(rep):
     side_for_report = _pick_best_side_for_report(rep)
     ret15 = rep["returns"]["15m"]
 
-    # Score context + trigger for that chosen side
     ctx1, ctx1_reasons, ctx1_up, ctx1_dn = _ctx_score(t1h, side_for_report)
     ctx4, ctx4_reasons, ctx4_up, ctx4_dn = _ctx_score(t4h, side_for_report)
     trg, trg_reasons, trg_up, trg_dn = _trg_score(t15, side_for_report, ret15)
@@ -936,27 +934,19 @@ def build_report_oldstyle(rep):
         "ema50": rep["tf"]["15m"]["ema50"],
     })
 
-    # Triggers count (up/down) only for display
     up_tr = ctx1_up + ctx4_up + trg_up
     dn_tr = ctx1_dn + ctx4_dn + trg_dn
 
-    # ranges
     lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", candles=6)
     lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", candles=6)
 
-    # Delta last 15m
     if t15.get("vol_buy") is not None:
         buy = t15["vol_buy"]; sell = t15["vol_sell"]; delt = t15["vol_delta"]
     else:
         buy = sell = delt = None
 
-    # Per-tf lines (like old)
     def tf_line(tf_name, snap):
-        lbl = tf_trend_label({
-            "price": snap["price"],
-            "ema20": snap["ema20"],
-            "ema50": snap["ema50"],
-        })
+        lbl = tf_trend_label({"price": snap["price"], "ema20": snap["ema20"], "ema50": snap["ema50"]})
         ret = rep["returns"][tf_name]
         return (
             f"`{tf_name:>3}` [{lbl}] p `{fmt_num(snap['price'],2)}` | "
@@ -967,7 +957,6 @@ def build_report_oldstyle(rep):
             f"VOLx `{fmt_num(snap['vol_ratio'],2)}` | ret `{fmt_num(ret,2)}%`"
         )
 
-    # Build message
     msg = ""
     msg += f"*{sym}*  |  *{alert}*  |  *DIR (15m): {dir15}*  |  total `{total}` (ctx1h `{ctx1}` + ctx4h `{ctx4}` + trg `{trg}`)\n"
     msg += f"Triggers: UP `{up_tr}` / DOWN `{dn_tr}`\n"
@@ -990,7 +979,6 @@ def build_report_oldstyle(rep):
     msg += tf_line("1h", t1h) + "\n"
     msg += tf_line("15m", t15) + "\n"
 
-    # Why flagged (compact but detailed)
     msg += "Why flagged:\n"
     msg += f"• Context scored as: {_ctx_label(ctx1_up+ctx4_up, ctx1_dn+ctx4_dn)} (side={side_for_report})\n"
     msg += "• Setup (1h):\n"
@@ -1003,7 +991,6 @@ def build_report_oldstyle(rep):
     for r in trg_reasons[:6]:
         msg += f"  • {r}\n"
 
-    # Signals found
     sigs = rep.get("signals", [])
     msg += f"Signals found: {len(sigs)}\n"
     for s in sigs[:6]:
@@ -1011,23 +998,15 @@ def build_report_oldstyle(rep):
         for rr in s.get("reasons", [])[:5]:
             msg += f"  • {rr}\n"
 
-    # add UTC footer like old manual report
-    msg = msg.strip()
     header = f"📊 *MANUAL REPORT ({sym})*\nUTC: `{ts}`\n_(Scanner only — NOT a signal. Use as input for analysis.)_\n\n"
-    return header + msg
+    return header + msg.strip()
 
-def build_report_all_one_message(reps):
-    # One Telegram message for ALL 3 symbols (within limits).
-    # We keep each symbol report detailed but capped.
+def build_report_all_text(reps):
     out = "📊 *MANUAL REPORT (ALL)*\n\n"
     for i, r in enumerate(reps):
         out += build_report_oldstyle(r)
         if i != len(reps) - 1:
             out += "\n\n——————————————————————\n\n"
-        # prevent overshoot before Telegram truncation
-        if len(out) > 3600:
-            out = out[:3600] + "\n…(truncated)"
-            break
     return out
 
 
@@ -1078,11 +1057,16 @@ def build_signal_message(rep, signal):
 # ================== TELEGRAM COMMAND HANDLER ================== #
 
 def handle_telegram_commands():
+    """
+    Reads updates and responds to /status, /report, /report SYMBOL.
+    IMPORTANT: If TELEGRAM_CHAT_ID is set and does not match, it will silently ignore.
+              So set it correctly to your chat/group id.
+    """
     global _last_update_id
     if not TELEGRAM_TOKEN:
         return
 
-    updates = telegram_get_updates(offset=_last_update_id + 1 if _last_update_id else None, timeout=0)
+    updates = telegram_get_updates(offset=_last_update_id + 1 if _last_update_id else None, timeout=20)
     if not updates:
         return
 
@@ -1090,30 +1074,36 @@ def handle_telegram_commands():
         _last_update_id = max(_last_update_id, u.get("update_id", 0))
         msg = u.get("message") or {}
         chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id", ""))
+        chat_id = str(chat.get("id", "")).strip()
 
         text = (msg.get("text") or "").strip()
         if not text:
             continue
-        if TELEGRAM_CHAT_ID and not is_allowed_chat(chat_id):
+
+        # Allow only configured chat (if set)
+        if not is_allowed_chat(chat_id):
             continue
+
+        # Normalize bot commands in groups: "/report@BotName" -> "/report"
+        if "@" in text and text.startswith("/"):
+            text = text.split("@", 1)[0].strip()
 
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v7 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
+                "v7.1 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
             continue
 
         if text.startswith("/report"):
-            # IMPORTANT: this block MUST be indented (fixes your IndentationError)
             parts = text.split()
             try:
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
-                    out = build_report_all_one_message(reps)
+                    out = build_report_all_text(reps)
+                    # send_telegram will split automatically into multiple messages if needed
                     send_telegram(out, chat_id=chat_id)
                 else:
                     sym = parts[1].upper()
@@ -1135,40 +1125,53 @@ def run_once():
         try:
             rep = analyze_symbol(sym)
         except Exception as e:
-            send_telegram(f"⚠️ Symbol error {sym}\n{e}")
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                send_telegram(f"⚠️ Symbol error {sym}\n{e}")
             continue
 
         for sig in rep["signals"]:
             if allowed_to_send(sym, sig, rep):
-                send_telegram(build_signal_message(rep, sig))
+                if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                    send_telegram(build_signal_message(rep, sig))
                 mark_sent(sym, sig, rep)
 
 
 # ================== RUNNER ================== #
 
 if __name__ == "__main__":
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    if TELEGRAM_TOKEN:
         telegram_delete_webhook()
+
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
-            "✅ Momentum bot ONLINE (v7 MULTI-ALERT + DETAILED REPORT)\n"
+            "✅ Momentum bot ONLINE (v7.1 FIXED)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
             "- Levels: SCOUT (early), PULLBACK (entry), CONFIRM (continuation)\n"
             "- Both sides: LONG + SHORT\n"
             f"- VOLx: scout≥{VOLX_SCOUT}, pullback≥{VOLX_PULLBACK}, confirm≥{VOLX_CONFIRM}\n"
             f"- Confirm late filter: soft {SOFT_LATE_ATR_CONFIRM} ATR, hard {LATE_ATR_BLOCK_CONFIRM} ATR\n"
-            "Manual: /report or /report ETHUSDT"
+            "Manual: /report or /report ETHUSDT\n\n"
+            "If /report doesn't respond in a GROUP: use /report@YourBotName or disable privacy mode in BotFather."
         )
 
     last_scan = 0
     while True:
         try:
+            # long polling inside; stable for commands
             handle_telegram_commands()
+
             now = time.time()
             if now - last_scan >= SCAN_SECONDS:
                 run_once()
                 last_scan = now
-        except Exception as e:
-            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                send_telegram(f"❌ Runtime error\n{e}")
-        time.sleep(CMD_POLL_SECONDS)
 
+        except Exception as e:
+            # Do not crash; try to report
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                try:
+                    send_telegram(f"❌ Runtime error\n{e}")
+                except Exception:
+                    pass
+
+        # small sleep so we don't spin CPU if no updates arrive
+        time.sleep(0.2)
