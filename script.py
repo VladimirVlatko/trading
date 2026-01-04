@@ -975,26 +975,26 @@ def handle_telegram_commands():
             continue
 
         if text.startswith("/report"):
-    parts = text.split()
-    send_telegram("🟡 Building report…", chat_id=chat_id)
-    try:
-        if len(parts) == 1:
-            reps = [analyze_symbol(s) for s in SYMBOLS]
-            msg = compress_report_all(reps)   # <-- ALWAYS ONE MESSAGE
-            send_telegram(msg, chat_id=chat_id)
-        else:
-            sym = parts[1].upper()
-            if sym not in SYMBOLS:
-                send_telegram(
-                    f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}",
-                    chat_id=chat_id
-                )
-                continue
-            r = analyze_symbol(sym)
-            send_telegram(build_report_full(r, include_signal_reasons=True), chat_id=chat_id)
-    except Exception as e:
-        send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
-    continue
+            parts = text.split()
+            send_telegram("🟡 Building report…", chat_id=chat_id)
+            try:
+                if len(parts) == 1:
+                    reps = [analyze_symbol(s) for s in SYMBOLS]
+                    msg = compress_report_all(reps)   # <-- ALWAYS ONE MESSAGE
+                    send_telegram(msg, chat_id=chat_id)
+                else:
+                    sym = parts[1].upper()
+                    if sym not in SYMBOLS:
+                        send_telegram(
+                            f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}",
+                            chat_id=chat_id
+                        )
+                        continue
+                    r = analyze_symbol(sym)
+                    send_telegram(build_report_full(r, include_signal_reasons=True), chat_id=chat_id)
+            except Exception as e:
+                send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
+            continue
 
 
 # ---------- MAIN SCAN (AUTO PUSH) ---------- #
@@ -1058,4 +1058,5 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ Runtime error\n{e}")
         time.sleep(CMD_POLL_SECONDS)
+
 
