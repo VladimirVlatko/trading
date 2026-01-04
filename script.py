@@ -1,13 +1,20 @@
 """
-MOMENTUM PRO – MULTI-ALERT (Telegram Enabled, SAFE) — v6.1 FIXED
-SCOUT + PULLBACK + CONFIRM, LONG/SHORT
-- AUTO alerts: concise
-- /report: FULL detailed analysis (as before)
-Scanner only — NOT a trade signal.
+MOMENTUM PRO — MULTI-ALERT + DETAILED REPORT (Telegram Enabled, SAFE)
+v7.0 (REWRITE) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
+
+GOAL
+- Scanner only — NOT a trade signal.
+- Sharper alert logic (don’t miss good moments) + still protected from spam.
+- Manual /report output is DETAILED (old-style) so you can forward it for pro analysis.
+
+NOTES
+- Binance Futures public endpoints only.
+- Telegram /report sends ONE message for ALL 3 symbols (kept under Telegram limits by compacting reasons).
 """
 
 import os
 import time
+import math
 import requests
 import numpy as np
 from datetime import datetime, UTC
@@ -26,12 +33,15 @@ ATR_LEN = 14
 
 VOL_LOOKBACK = 20
 SLOPE_LOOKBACK = 6
+DELTA_MED_LOOKBACK = 20
+
+SWING_LOOKBACK = 5
 
 RETURN_LOOKBACK_15M = 6
 RETURN_LOOKBACK_1H = 6
 RETURN_LOOKBACK_4H = 6
 
-# --- thresholds ---
+# --- alert thresholds (tuned to catch early but not spam) ---
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
 VOLX_CONFIRM = 1.10
@@ -41,27 +51,29 @@ RSI_SCOUT_SHORT = 48
 RSI_CONFIRM_LONG = 58
 RSI_CONFIRM_SHORT = 42
 
-SWING_LOOKBACK = 5
-
-DELTA_MED_LOOKBACK = 20
+# Delta / intent
 DELTA_DOM_MULT = 1.15
 BODY_ATR_MIN = 0.35
 
+# Pullback logic
 PULLBACK_TOUCH_ATR = 0.30
 PULLBACK_LOOKBACK_SEC = 2 * 60 * 60
 
+# Late filter for confirm
 LATE_ATR_BLOCK_CONFIRM = 1.60
 SOFT_LATE_ATR_CONFIRM = 1.10
 
+# Scan / command loop
 SCAN_SECONDS = 60
 CMD_POLL_SECONDS = 5
 
+# Anti-spam
 COOLDOWN_SCOUT = 12 * 60
 COOLDOWN_PULLBACK = 35 * 60
 COOLDOWN_CONFIRM = 60 * 60
-
 ONE_PER_CANDLE = True
 
+# Minimum move required vs last same alert (prevents repeats)
 MIN_MOVE_SCOUT = {"BTCUSDT": 0.10, "ETHUSDT": 0.14, "SOLUSDT": 0.18}
 MIN_MOVE_PULLBACK = {"BTCUSDT": 0.15, "ETHUSDT": 0.20, "SOLUSDT": 0.25}
 MIN_MOVE_CONFIRM = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
@@ -80,7 +92,7 @@ KLINE_SEED_LIMIT = 220
 KLINE_MIN_BARS = 120
 KLINE_TAIL_FETCH = 2
 
-# ============================================ #
+# ================== STATE ================== #
 
 _last_update_id = 0
 _prev_oi = {}
@@ -95,7 +107,7 @@ _DERIV_CACHE = {}                 # symbol -> (ts, dict)
 DERIV_TTL_SEC = 30
 
 
-# ---------- RATE LIMIT HELPERS ---------- #
+# ================== RATE LIMIT HELPERS ================== #
 
 def _rate_guard():
     now = time.time()
@@ -122,7 +134,7 @@ def _sleep_backoff(attempt):
     time.sleep(s)
 
 
-# ---------- NETWORK HELPERS ---------- #
+# ================== NETWORK HELPERS ================== #
 
 def http_get_json(url, params=None, timeout=10):
     for attempt in range(5):
@@ -151,7 +163,7 @@ def http_get_json(url, params=None, timeout=10):
             _sleep_backoff(attempt)
 
 
-# ---------- TELEGRAM ---------- #
+# ================== TELEGRAM ================== #
 
 def send_telegram(message: str, chat_id: str | None = None):
     if not TELEGRAM_TOKEN:
@@ -160,7 +172,7 @@ def send_telegram(message: str, chat_id: str | None = None):
     if not target:
         return
 
-    # Telegram hard-ish safe limit
+    # Telegram limit is 4096. Keep safe margin.
     if message and len(message) > 3900:
         message = message[:3900] + "\n…(truncated)"
 
@@ -194,7 +206,7 @@ def is_allowed_chat(chat_id: str) -> bool:
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
 
 
-# ---------- INDICATORS ---------- #
+# ================== INDICATORS ================== #
 
 def ema(series, length):
     series = np.asarray(series, dtype=float)
@@ -250,7 +262,7 @@ def atr_distance(price, ema20, atr):
     return abs(price - ema20) / atr
 
 
-# ---------- BINANCE DATA (INCREMENTAL) ---------- #
+# ================== BINANCE DATA (INCREMENTAL) ================== #
 
 def _fetch_klines_raw(symbol, interval, limit=200):
     url = f"{BINANCE_FUTURES}/fapi/v1/klines"
@@ -281,8 +293,8 @@ def get_klines_cached(symbol, tf):
         elif ot > k[-1, 0]:
             k = np.vstack([k, row])
 
-    if len(k) > 400:
-        k = k[-350:]
+    if len(k) > 420:
+        k = k[-360:]
 
     _KLINE_CACHE[key] = k
     return k
@@ -307,7 +319,7 @@ def fetch_derivatives_cached(symbol):
     return d
 
 
-# ---------- SNAPSHOT ---------- #
+# ================== SNAPSHOT ================== #
 
 def tf_snapshot(k, tf_name):
     op = k[:, 1]
@@ -329,7 +341,7 @@ def tf_snapshot(k, tf_name):
     vol_ratio = vol[-1] / (np.mean(vol[-VOL_LOOKBACK:]) + 1e-12) if len(vol) >= VOL_LOOKBACK else 1.0
     open_time = int(k[-1, 0])
 
-    # Delta series
+    # Delta series (taker buy vol exists at index 9 in Binance futures klines)
     if k.shape[1] > 9:
         taker_buy_series = k[:, 9].astype(float)
         total_vol_series = vol.astype(float)
@@ -372,6 +384,7 @@ def tf_snapshot(k, tf_name):
         "close_series": close,
         "high_series": high,
         "low_series": low,
+        "vol_series": vol,
     }
 
 def compute_returns(tf_snaps):
@@ -383,7 +396,7 @@ def compute_returns(tf_snaps):
     return out
 
 
-# ---------- HELPERS ---------- #
+# ================== STRUCTURE / DELTA / INTENT ================== #
 
 def _structure_flags_15m(tf15, side):
     close = tf15["close_series"]
@@ -413,7 +426,7 @@ def _delta_dominance(tf15):
     ds = tf15.get("delta_series")
     dn = tf15.get("vol_delta")
     if ds is None or dn is None:
-        return False, "delta n/a"
+        return False, "Δ n/a"
     tail = ds[-DELTA_MED_LOOKBACK:] if len(ds) >= DELTA_MED_LOOKBACK else ds
     med = float(np.median(np.abs(tail))) + 1e-12
     ok = abs(float(dn)) >= (DELTA_DOM_MULT * med)
@@ -426,26 +439,128 @@ def _intent_candle(tf15):
         return False
     return abs(float(body)) >= (BODY_ATR_MIN * float(atr))
 
-def _delta_sign_ok(tf15, side):
+
+# ================== CONTEXT SCORING (old-style report) ================== #
+
+def _ctx_score(tf_snap, side):
     """
-    CONFIRM should not fight current taker flow.
-    LONG -> delta >= 0
-    SHORT -> delta <= 0
-    If delta n/a -> allow (neutral).
+    Returns: (score_int, reasons_list, up_count, down_count)
+    Score designed to mimic your old "ctx1h/ctx4h" style.
     """
-    d = tf15.get("vol_delta")
-    if d is None:
-        return True
-    try:
-        d = float(d)
-    except Exception:
-        return True
+    p = tf_snap["price"]
+    e20 = tf_snap["ema20"]
+    e50 = tf_snap["ema50"]
+    s20 = tf_snap["ema20_slp"]
+    s50 = tf_snap["ema50_slp"]
+    r = tf_snap["rsi"]
+
+    reasons = []
+    score = 0
+    up = 0
+    down = 0
+
+    # Price position
+    if p > e20 and p > e50:
+        score += 2; up += 2; reasons.append("HTF price above EMA20/50")
+    elif p < e20 and p < e50:
+        score += 2; down += 2; reasons.append("HTF price below EMA20/50")
+    else:
+        score += 1; reasons.append("HTF price mixed vs EMA20/50")
+
+    # EMA stack
+    if e20 > e50:
+        score += 1; up += 1; reasons.append("HTF EMA20 > EMA50")
+    else:
+        score += 1; down += 1; reasons.append("HTF EMA20 < EMA50")
+
+    # Slopes
+    if s20 > 0 and s50 > 0:
+        score += 1; up += 1; reasons.append("HTF EMA slopes positive")
+    elif s20 < 0 and s50 < 0:
+        score += 1; down += 1; reasons.append("HTF EMA slopes negative")
+    else:
+        reasons.append("HTF EMA slopes mixed")
+
+    # RSI supportive (directional nuance)
     if side == "LONG":
-        return d >= 0
-    return d <= 0
+        if r >= 52:
+            score += 1; up += 1; reasons.append("HTF RSI supportive")
+        else:
+            reasons.append("HTF RSI weak")
+    else:
+        if r <= 48:
+            score += 1; down += 1; reasons.append("HTF RSI supportive")
+        else:
+            reasons.append("HTF RSI weak")
+
+    return score, reasons, up, down
+
+def _trg_score(tf15, side, ret15):
+    """
+    Returns trigger score like old report "trg".
+    Also returns trigger reasons + up/down counts.
+    """
+    p = tf15["price"]
+    e20 = tf15["ema20"]
+    atr = tf15["atr"]
+    volx = tf15["vol_ratio"]
+
+    reasons = []
+    score = 0
+    up = 0
+    down = 0
+
+    # Price vs EMA20
+    if p > e20:
+        reasons.append("15m price above EMA20"); score += 1; up += 1
+    elif p < e20:
+        reasons.append("15m price below EMA20"); score += 1; down += 1
+    else:
+        reasons.append("15m price on EMA20"); score += 1
+
+    # Structure
+    st = _structure_flags_15m(tf15, side)
+    if st["break"]:
+        reasons.append("Structure (break)"); score += 1
+        if side == "LONG": up += 1
+        else: down += 1
+    elif st["reclaim"]:
+        reasons.append("Structure (reclaim/reject EMA20)"); score += 1
+        if side == "LONG": up += 1
+        else: down += 1
+    else:
+        reasons.append("No structure (no break/reclaim)")
+
+    # Delta dominance
+    d_ok, d_msg = _delta_dominance(tf15)
+    if d_ok:
+        reasons.append(f"DELTA dominance ({d_msg})"); score += 1
+        # direction from delta sign
+        dn = tf15.get("vol_delta")
+        if dn is not None:
+            if dn > 0: up += 1
+            elif dn < 0: down += 1
+
+    # ATR distance early zone
+    dist = atr_distance(p, e20, atr)
+    reasons.append(f"ATR dist: {dist:.2f} (target early zone 0.25–0.75/1.00)")
+    score += 1
+
+    # Return "intent"
+    if side == "LONG" and ret15 > 0:
+        reasons.append("ret15 supports LONG"); score += 1; up += 1
+    elif side == "SHORT" and ret15 < 0:
+        reasons.append("ret15 supports SHORT"); score += 1; down += 1
+    else:
+        reasons.append("ret15 neutral/contra")
+
+    # Volx info (not score, but in report)
+    reasons.append(f"VOLx snapshot {volx:.2f}")
+
+    return score, reasons, up, down
 
 
-# ---------- SIGNAL LOGIC ---------- #
+# ================== SIGNAL LOGIC ================== #
 
 def _scout_signal(tf15, tf1h, side, ret15):
     reasons = []
@@ -461,26 +576,29 @@ def _scout_signal(tf15, tf1h, side, ret15):
     if volx < VOLX_SCOUT:
         return None
 
+    # SCOUT: allow earlier entries
     if side == "LONG":
         if rsi1h < RSI_SCOUT_LONG:
             return None
-        if not (price > e20 or ret15 >= 0.35):
+        if not (price > e20 or ret15 >= 0.25):  # a bit looser to avoid misses
             return None
     else:
         if rsi1h > RSI_SCOUT_SHORT:
             return None
-        if not (price < e20 or ret15 <= -0.35):
+        if not (price < e20 or ret15 <= -0.25):
             return None
 
     reasons.append(f"VOLx>=SCOUT ({volx:.2f}x)")
     reasons.append(f"RSI(1h) ok ({rsi1h:.1f})")
     reasons.append(f"ret15 ({ret15:+.2f}%)")
+
     if st["break"]:
         reasons.append(f"STRUCT break ({st['level']:.2f})")
     elif st["reclaim"]:
         reasons.append("STRUCT reclaim/reject EMA20")
     else:
         reasons.append("STRUCT none (allowed for SCOUT)")
+
     if d_ok:
         reasons.append(f"DELTA ok ({d_msg})")
     if intent:
@@ -509,11 +627,12 @@ def _pullback_signal(tf15, symbol, side):
     op = tf15["open"]
     cl = tf15["price"]
 
+    # Pullback: require bounce candle
     if side == "LONG":
-        if not (cl > op and cl > e20):
+        if not (cl > op and cl >= e20):
             return None
     else:
-        if not (cl < op and cl < e20):
+        if not (cl < op and cl <= e20):
             return None
 
     d_ok, d_msg = _delta_dominance(tf15)
@@ -533,12 +652,6 @@ def _pullback_signal(tf15, symbol, side):
     return {"level": "PULLBACK", "side": side, "reasons": reasons}
 
 def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
-    """
-    v6.1 FIX:
-    - CONFIRM MUST have structure (break OR reclaim/reject)
-    - CONFIRM LONG must not be below EMA20
-    - CONFIRM must respect delta sign (LONG delta>=0, SHORT delta<=0) when available
-    """
     reasons = []
     price = tf15["price"]
     e20 = tf15["ema20"]
@@ -554,28 +667,9 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
         return None
 
     st = _structure_flags_15m(tf15, side)
-
-    # HARD: confirm must have structure (no more "STRUCT none" confirm)
-    if not (st["break"] or st["reclaim"]):
-        return None
-
-    # Soft late: if already stretched, require an actual break (not just reclaim)
     if dist >= SOFT_LATE_ATR_CONFIRM and not st["break"]:
         return None
 
-    # Price location sanity for confirm
-    if side == "LONG":
-        if price < e20:
-            return None
-    else:
-        if price > e20:
-            return None
-
-    # Delta sign sanity (prevents exactly what you showed on SOL)
-    if not _delta_sign_ok(tf15, side):
-        return None
-
-    # HTF regime check
     if side == "LONG":
         if rsi1h < RSI_CONFIRM_LONG:
             return None
@@ -597,22 +691,20 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
 
     if st["break"]:
         reasons.append(f"STRUCT break ({st['level']:.2f})")
-    else:
+    elif st["reclaim"]:
         reasons.append("STRUCT reclaim/reject EMA20")
+    else:
+        reasons.append("STRUCT none")
 
     if d_ok:
         reasons.append(f"DELTA ok ({d_msg})")
-    else:
-        # still show why, but signal already passed delta sign sanity
-        reasons.append(f"DELTA not dom ({d_msg})")
-
     if intent:
         reasons.append("Intent candle")
 
     return {"level": "CONFIRM", "side": side, "reasons": reasons}
 
 
-# ---------- ANALYSIS ---------- #
+# ================== ANALYSIS ================== #
 
 def analyze_symbol(symbol):
     tf_snaps = {}
@@ -630,27 +722,35 @@ def analyze_symbol(symbol):
 
     signals = []
 
+    # Generate signals for both sides
     s_long = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "LONG", ret_15m)
-    if s_long: signals.append(s_long)
+    if s_long:
+        signals.append(s_long)
 
     s_short = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "SHORT", ret_15m)
-    if s_short: signals.append(s_short)
+    if s_short:
+        signals.append(s_short)
 
     pb_long = _pullback_signal(tf_snaps["15m"], symbol, "LONG")
-    if pb_long: signals.append(pb_long)
+    if pb_long:
+        signals.append(pb_long)
 
     pb_short = _pullback_signal(tf_snaps["15m"], symbol, "SHORT")
-    if pb_short: signals.append(pb_short)
+    if pb_short:
+        signals.append(pb_short)
 
     c_long = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "LONG", ret_15m)
-    if c_long: signals.append(c_long)
+    if c_long:
+        signals.append(c_long)
 
     c_short = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "SHORT", ret_15m)
-    if c_short: signals.append(c_short)
+    if c_short:
+        signals.append(c_short)
 
+    # Public tf snapshot (without big arrays)
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
-            if kk not in ("close_series", "high_series", "low_series", "delta_series")}
+            if kk not in ("close_series", "high_series", "low_series", "delta_series", "vol_series")}
         for k, v in tf_snaps.items()
     }
 
@@ -658,13 +758,14 @@ def analyze_symbol(symbol):
         "symbol": symbol,
         "signals": signals,
         "tf": tf_public,
+        "tf_raw": tf_snaps,     # keep raw for report scoring
         "returns": returns,
         "deriv": deriv,
         "oi_change_pct": oi_change_pct,
     }
 
 
-# ---------- ANTI-SPAM / GATING ---------- #
+# ================== ANTI-SPAM / GATING ================== #
 
 def _min_move_for(symbol, level):
     if level == "SCOUT":
@@ -718,11 +819,12 @@ def mark_sent(symbol, signal, report):
     _last_15m_candle_by_key[key] = candle_ot
     _last_alert_price_by_key[key] = float(price)
 
+    # Impulse memory for pullback
     if level in ("SCOUT", "CONFIRM"):
         _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(price)}
 
 
-# ---------- MESSAGE FORMAT ---------- #
+# ================== REPORT FORMATTING (OLD STYLE) ================== #
 
 def fmt_num(x, digits=2):
     try:
@@ -749,88 +851,183 @@ def range_snapshot_from_klines(symbol, tf, candles: int):
     hi = float(np.max(tail[:, 2]))
     return lo, hi
 
-def build_report_full(report, include_signal_reasons=True):
+def _ctx_label(up_cnt, down_cnt):
+    if up_cnt > down_cnt + 1:
+        return "UP-ish"
+    if down_cnt > up_cnt + 1:
+        return "DOWN-ish"
+    return "MIX"
+
+def _pick_best_side_for_report(rep):
     """
-    FULL /report output (detailed) — restores the previous "analysis report" feel.
+    For manual report we show the side that has stronger context score,
+    because your old report had a single direction line.
+    """
+    tf1 = rep["tf_raw"]["1h"]
+    tf4 = rep["tf_raw"]["4h"]
+    # quick compare ctx (LONG vs SHORT)
+    s1L, _, upL1, dnL1 = _ctx_score(tf1, "LONG")
+    s4L, _, upL4, dnL4 = _ctx_score(tf4, "LONG")
+    s1S, _, upS1, dnS1 = _ctx_score(tf1, "SHORT")
+    s4S, _, upS4, dnS4 = _ctx_score(tf4, "SHORT")
+
+    totalL = s1L + s4L + (upL1+upL4) - (dnL1+dnL4)
+    totalS = s1S + s4S + (dnS1+dnS4) - (upS1+upS4)
+
+    return "LONG" if totalL >= totalS else "SHORT"
+
+def _alert_level_from_total(total_score):
+    # roughly matches your old “ALERT 2/3” feel
+    if total_score >= 13:
+        return "ALERT 3"
+    if total_score >= 10:
+        return "ALERT 2"
+    return "ALERT 1"
+
+def build_report_oldstyle(rep):
+    """
+    DETAILED report like your old one:
+    - headline summary line with ctx/trg totals
+    - Deriv/RANGE/DELTA
+    - 4h/1h/15m detailed lines
+    - Why flagged (context + trigger breakdown)
+    - Signals found list (SCOUT/PULLBACK/CONFIRM)
     """
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    sym = report["symbol"]
-    deriv = report["deriv"]
-    oi_chg = report["oi_change_pct"]
+    sym = rep["symbol"]
 
-    t15 = report["tf"]["15m"]
-    t1h = report["tf"]["1h"]
-    t4h = report["tf"]["4h"]
+    t15 = rep["tf_raw"]["15m"]
+    t1h = rep["tf_raw"]["1h"]
+    t4h = rep["tf_raw"]["4h"]
+    deriv = rep["deriv"]
+    oi_chg = rep["oi_change_pct"]
 
+    side_for_report = _pick_best_side_for_report(rep)
+    ret15 = rep["returns"]["15m"]
+
+    # Score context + trigger for that chosen side
+    ctx1, ctx1_reasons, ctx1_up, ctx1_dn = _ctx_score(t1h, side_for_report)
+    ctx4, ctx4_reasons, ctx4_up, ctx4_dn = _ctx_score(t4h, side_for_report)
+    trg, trg_reasons, trg_up, trg_dn = _trg_score(t15, side_for_report, ret15)
+
+    total = ctx1 + ctx4 + trg
+    alert = _alert_level_from_total(total)
+
+    dir15 = tf_trend_label({
+        "price": rep["tf"]["15m"]["price"],
+        "ema20": rep["tf"]["15m"]["ema20"],
+        "ema50": rep["tf"]["15m"]["ema50"],
+    })
+
+    # Triggers count (up/down) only for display
+    up_tr = ctx1_up + ctx4_up + trg_up
+    dn_tr = ctx1_dn + ctx4_dn + trg_dn
+
+    # ranges
     lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", candles=6)
     lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", candles=6)
 
-    lbl15 = tf_trend_label(t15)
-    lbl1h = tf_trend_label(t1h)
-    lbl4h = tf_trend_label(t4h)
+    # Delta last 15m
+    if t15.get("vol_buy") is not None:
+        buy = t15["vol_buy"]; sell = t15["vol_sell"]; delt = t15["vol_delta"]
+    else:
+        buy = sell = delt = None
 
-    msg = f"📊 MANUAL REPORT ({sym})\nUTC: {ts}\n"
-    msg += "(Scanner only — NOT a signal. Use as input for analysis.)\n\n"
+    # Per-tf lines (like old)
+    def tf_line(tf_name, snap):
+        lbl = tf_trend_label({
+            "price": snap["price"],
+            "ema20": snap["ema20"],
+            "ema50": snap["ema50"],
+        })
+        ret = rep["returns"][tf_name]
+        return (
+            f"`{tf_name:>3}` [{lbl}] p `{fmt_num(snap['price'],2)}` | "
+            f"EMA20 `{fmt_num(snap['ema20'],2)}`({fmt_num(snap['ema20_slp'],2)}) "
+            f"EMA50 `{fmt_num(snap['ema50'],2)}`({fmt_num(snap['ema50_slp'],2)}) | "
+            f"RSI `{fmt_num(snap['rsi'],1)}`({fmt_num(snap['rsi_slp'],1)}) | "
+            f"ATR `{fmt_num(snap['atr'],2)}` | "
+            f"VOLx `{fmt_num(snap['vol_ratio'],2)}` | ret `{fmt_num(ret,2)}%`"
+        )
 
+    # Build message
+    msg = ""
+    msg += f"*{sym}*  |  *{alert}*  |  *DIR (15m): {dir15}*  |  total `{total}` (ctx1h `{ctx1}` + ctx4h `{ctx4}` + trg `{trg}`)\n"
+    msg += f"Triggers: UP `{up_tr}` / DOWN `{dn_tr}`\n"
     msg += (
-        f"Deriv: mark {fmt_num(deriv['mark'],2)} | index {fmt_num(deriv['index'],2)} | "
-        f"funding {fmt_num(deriv['funding'],4)}% | basis {fmt_num(deriv['basis'],4)}% | "
-        f"OI {fmt_num(deriv['oi'],0)}"
+        f"Deriv: mark `{fmt_num(deriv['mark'],2)}` | index `{fmt_num(deriv['index'],2)}` | "
+        f"funding `{fmt_num(deriv['funding'],4)}%` | basis `{fmt_num(deriv['basis'],4)}%` | "
+        f"OI `{fmt_num(deriv['oi'],0)}`"
     )
     if oi_chg is not None:
-        msg += f" | OIΔ {fmt_num(oi_chg,2)}%"
+        msg += f" | OIΔ `{fmt_num(oi_chg,2)}%`"
     msg += "\n"
-
     msg += (
-        f"RANGE: 4h(24h) low {fmt_num(lo_4h,2)} / high {fmt_num(hi_4h,2)}  |  "
-        f"1h(6h) low {fmt_num(lo_1h,2)} / high {fmt_num(hi_1h,2)}\n"
+        f"RANGE: 4h(24h) low `{fmt_num(lo_4h,2)}` / high `{fmt_num(hi_4h,2)}`  |  "
+        f"1h(6h) low `{fmt_num(lo_1h,2)}` / high `{fmt_num(hi_1h,2)}`\n"
     )
+    if buy is not None:
+        msg += f"DELTA(15m): buy `{fmt_num(buy,2)}` | sell `{fmt_num(sell,2)}` | Δ `{fmt_num(delt,2)}`\n"
 
-    if t15.get("vol_buy") is not None:
-        msg += (
-            f"DELTA(15m): buy {fmt_num(t15['vol_buy'],2)} | sell {fmt_num(t15['vol_sell'],2)} | "
-            f"Δ {fmt_num(t15['vol_delta'],2)}\n"
-        )
+    msg += tf_line("4h", t4h) + "\n"
+    msg += tf_line("1h", t1h) + "\n"
+    msg += tf_line("15m", t15) + "\n"
 
-    def tf_line(tf_name, t, lbl):
-        return (
-            f"{tf_name:>3} [{lbl}] "
-            f"p {fmt_num(t['price'],2)} | "
-            f"EMA20 {fmt_num(t['ema20'],2)}({fmt_num(t['ema20_slp'],2)}) "
-            f"EMA50 {fmt_num(t['ema50'],2)}({fmt_num(t['ema50_slp'],2)}) | "
-            f"RSI {fmt_num(t['rsi'],1)}({fmt_num(t['rsi_slp'],1)}) | "
-            f"ATR {fmt_num(t['atr'],2)} | "
-            f"VOLx {fmt_num(t['vol_ratio'],2)} | "
-            f"ret {fmt_num(report['returns'][tf_name],2)}%\n"
-        )
+    # Why flagged (compact but detailed)
+    msg += "Why flagged:\n"
+    msg += f"• Context scored as: {_ctx_label(ctx1_up+ctx4_up, ctx1_dn+ctx4_dn)} (side={side_for_report})\n"
+    msg += "• Setup (1h):\n"
+    for r in ctx1_reasons[:4]:
+        msg += f"  • {r}\n"
+    msg += "• Setup (4h):\n"
+    for r in ctx4_reasons[:4]:
+        msg += f"  • {r}\n"
+    msg += "• Trigger (15m):\n"
+    for r in trg_reasons[:6]:
+        msg += f"  • {r}\n"
 
-    msg += tf_line("4h", t4h, lbl4h)
-    msg += tf_line("1h", t1h, lbl1h)
-    msg += tf_line("15m", t15, lbl15)
-    msg += "\n"
-
-    sigs = report.get("signals", [])
+    # Signals found
+    sigs = rep.get("signals", [])
     msg += f"Signals found: {len(sigs)}\n"
-    for s in sigs:
-        msg += f"- {s['level']} {s['side']}\n"
-        if include_signal_reasons:
-            for r in s.get("reasons", [])[:14]:
-                msg += f"  • {r}\n"
+    for s in sigs[:6]:
+        msg += f"• {s['level']} {s['side']}\n"
+        for rr in s.get("reasons", [])[:5]:
+            msg += f"  • {rr}\n"
 
-    return msg.strip()
+    # add UTC footer like old manual report
+    msg = msg.strip()
+    header = f"📊 *MANUAL REPORT ({sym})*\nUTC: `{ts}`\n_(Scanner only — NOT a signal. Use as input for analysis.)_\n\n"
+    return header + msg
 
-def build_signal_message(report, signal):
+def build_report_all_one_message(reps):
+    # One Telegram message for ALL 3 symbols (within limits).
+    # We keep each symbol report detailed but capped.
+    out = "📊 *MANUAL REPORT (ALL)*\n\n"
+    for i, r in enumerate(reps):
+        out += build_report_oldstyle(r)
+        if i != len(reps) - 1:
+            out += "\n\n——————————————————————\n\n"
+        # prevent overshoot before Telegram truncation
+        if len(out) > 3600:
+            out = out[:3600] + "\n…(truncated)"
+            break
+    return out
+
+
+# ================== ALERT MESSAGE (AUTO PUSH) ================== #
+
+def build_signal_message(rep, signal):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    sym = report["symbol"]
+    sym = rep["symbol"]
     side = signal["side"]
     level = signal["level"]
 
-    deriv = report["deriv"]
-    oi_chg = report["oi_change_pct"]
+    deriv = rep["deriv"]
+    oi_chg = rep["oi_change_pct"]
 
-    t15 = report["tf"]["15m"]
-    t1h = report["tf"]["1h"]
-    t4h = report["tf"]["4h"]
+    t15 = rep["tf"]["15m"]
+    t1h = rep["tf"]["1h"]
+    t4h = rep["tf"]["4h"]
 
     msg = f"🚨 {sym} — {level} | {side}\nUTC: {ts}\n"
     msg += "(Scanner only — NOT a signal. Forward to filter.)\n\n"
@@ -838,239 +1035,30 @@ def build_signal_message(report, signal):
     msg += (
         f"Price: {fmt_num(t15['price'],2)} | EMA20(15m): {fmt_num(t15['ema20'],2)} | EMA50(15m): {fmt_num(t15['ema50'],2)}\n"
         f"RSI: 15m {fmt_num(t15['rsi'],1)} | 1h {fmt_num(t1h['rsi'],1)} | 4h {fmt_num(t4h['rsi'],1)}\n"
-        f"ATR(15m): {fmt_num(t15['atr'],2)} | VOLx(15m): {fmt_num(t15['vol_ratio'],2)} | ret15: {fmt_num(report['returns']['15m'],2)}%\n"
+        f"ATR(15m): {fmt_num(t15['atr'],2)} | VOLx(15m): {fmt_num(t15['vol_ratio'],2)} | ret15: {fmt_num(rep['returns']['15m'],2)}%\n"
     )
 
-    if t15.get("vol_buy") is not None:
-        msg += f"DELTA(15m): buy {fmt_num(t15['vol_buy'],2)} | sell {fmt_num(t15['vol_sell'],2)} | Δ {fmt_num(t15['vol_delta'],2)}\n"
+    if rep["tf"]["15m"].get("vol_buy") is not None:
+        msg += (
+            f"DELTA(15m): buy {fmt_num(rep['tf']['15m']['vol_buy'],2)} | "
+            f"sell {fmt_num(rep['tf']['15m']['vol_sell'],2)} | "
+            f"Δ {fmt_num(rep['tf']['15m']['vol_delta'],2)}\n"
+        )
 
     msg += (
-        f"Deriv: mark {fmt_num(deriv['mark'],2)} | funding {fmt_num(deriv['funding'],4)}% | basis {fmt_num(deriv['basis'],4)}% | OI {fmt_num(deriv['oi'],0)}"
+        f"Deriv: mark {fmt_num(deriv['mark'],2)} | funding {fmt_num(deriv['funding'],4)}% | "
+        f"basis {fmt_num(deriv['basis'],4)}% | OI {fmt_num(deriv['oi'],0)}"
     )
     if oi_chg is not None:
         msg += f" | OIΔ {fmt_num(oi_chg,2)}%"
     msg += "\n\nWhy flagged:\n"
-    for line in signal["reasons"][:14]:
+    for line in signal["reasons"][:10]:
         msg += f"- {line}\n"
 
     return msg.strip()
 
 
-# ---------- MANUAL COMMAND HANDLER ---------- #
-
-def _send_long_text(chat_id: str, text: str):
-    """
-    Sends long text in safe chunks, preserving readability.
-    """
-    if len(text) <= 3900:
-        send_telegram(text, chat_id=chat_id)
-        return
-
-    chunks = []
-    buf = ""
-    for line in text.splitlines(True):
-        if len(buf) + len(line) > 3800:
-            chunks.append(buf)
-            buf = ""
-        buf += line
-    if buf:
-        chunks.append(buf)
-
-    for c in chunks:
-        send_telegram(c.strip(), chat_id=chat_id)
-        time.sleep(0.3)
-
-TG_LIMIT = 3900  # safe cap
-
-def build_report_all_one_message(reps):
-    out = "📊 MANUAL REPORT (ALL)\n\n"
-    for i, r in enumerate(reps, 1):
-        out += build_report_full(r, include_signal_reasons=True)
-        if i != len(reps):
-            out += "\n\n" + "—" * 20 + "\n\n"
-    return out
-
-def compress_report_all(reps):
-    # 1) Try full
-    msg = build_report_all_one_message(reps)
-    if len(msg) <= TG_LIMIT:
-        return msg
-
-    # 2) Remove signal reasons
-    out = "📊 MANUAL REPORT (ALL)\n\n"
-    for i, r in enumerate(reps, 1):
-        out += build_report_full(r, include_signal_reasons=False)
-        if i != len(reps):
-            out += "\n\n" + "—" * 20 + "\n\n"
-    msg = out
-    if len(msg) <= TG_LIMIT:
-        return msg
-
-    # 3) Hard compress – keep core analysis
-    out = "📊 MANUAL REPORT (ALL)\n\n"
-    for i, r in enumerate(reps, 1):
-        sym = r["symbol"]
-        deriv = r["deriv"]
-        oi_chg = r["oi_change_pct"]
-        t15 = r["tf"]["15m"]; t1h = r["tf"]["1h"]; t4h = r["tf"]["4h"]
-
-        lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", 6)
-        lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", 6)
-
-        out += f"📊 {sym}\n"
-        out += (
-            f"Deriv: mark {fmt_num(deriv['mark'],2)} | funding {fmt_num(deriv['funding'],4)}% | "
-            f"basis {fmt_num(deriv['basis'],4)}% | OI {fmt_num(deriv['oi'],0)}"
-        )
-        if oi_chg is not None:
-            out += f" | OIΔ {fmt_num(oi_chg,2)}%"
-        out += "\n"
-        out += (
-            f"RANGE 4h: {fmt_num(lo_4h,2)}–{fmt_num(hi_4h,2)} | "
-            f"1h: {fmt_num(lo_1h,2)}–{fmt_num(hi_1h,2)}\n"
-        )
-        out += (
-            f"4h p {fmt_num(t4h['price'],2)} RSI {fmt_num(t4h['rsi'],1)} | "
-            f"1h p {fmt_num(t1h['price'],2)} RSI {fmt_num(t1h['rsi'],1)} | "
-            f"15m p {fmt_num(t15['price'],2)} RSI {fmt_num(t15['rsi'],1)}\n"
-        )
-        out += f"Signals found: {len(r['signals'])}\n"
-
-        if i != len(reps):
-            out += "\n" + "—" * 20 + "\n\n"
-
-    if len(out) > TG_LIMIT:
-        out = out[:TG_LIMIT - 60] + "\n…(truncated to fit Telegram limit)"
-    return out
-
-def regime_score(tf_snap, direction):
-    price, e20, e50 = tf_snap["price"], tf_snap["ema20"], tf_snap["ema50"]
-    e20_slp, e50_slp, rsi = tf_snap["ema20_slp"], tf_snap["ema50_slp"], tf_snap["rsi"]
-    score = 0
-    reasons = []
-    if direction == "UP":
-        if price > e20 and price > e50: score += 2; reasons.append("HTF price above EMA20/50")
-        if e20 > e50: score += 1; reasons.append("HTF EMA20 > EMA50")
-        if e20_slp > 0 and e50_slp > 0: score += 1; reasons.append("HTF EMA slopes positive")
-        if rsi >= 52: score += 1; reasons.append("HTF RSI supportive")
-    else:
-        if price < e20 and price < e50: score += 2; reasons.append("HTF price below EMA20/50")
-        if e20 < e50: score += 1; reasons.append("HTF EMA20 < EMA50")
-        if e20_slp < 0 and e50_slp < 0: score += 1; reasons.append("HTF EMA slopes negative")
-        if rsi <= 48: score += 1; reasons.append("HTF RSI weak")
-    return score, reasons
-
-def trigger_score_15m_legacy(tf15, direction, ret_15m):
-    # “lite” верзија само за репорт (слично на старото)
-    price, e20, e50 = tf15["price"], tf15["ema20"], tf15["ema50"]
-    rsi, rsi_slp, volx = tf15["rsi"], tf15["rsi_slp"], tf15["vol_ratio"]
-    atr = tf15["atr"]
-
-    st = _structure_flags_15m(tf15, "LONG" if direction == "UP" else "SHORT")
-    d_ok, d_msg = _delta_dominance(tf15)
-
-    score = 0
-    reasons = []
-
-    if direction == "UP":
-        if price > e20: score += 1; reasons.append("15m price above EMA20")
-        if price > e20 and price > e50: score += 1; reasons.append("15m price above EMA20/50")
-        if rsi >= 55: score += 1; reasons.append("15m RSI reclaim (>=55)")
-        if rsi_slp >= 2: score += 1; reasons.append("15m RSI rising")
-        if ret_15m >= 0.10: score += 1; reasons.append(f"15m return positive ({ret_15m:+.2f}%)")
-    else:
-        if price < e20: score += 1; reasons.append("15m price below EMA20")
-        if price < e20 and price < e50: score += 1; reasons.append("15m price below EMA20/50")
-        if rsi <= 45: score += 1; reasons.append("15m RSI break (<=45)")
-        if rsi_slp <= -2: score += 1; reasons.append("15m RSI falling")
-        if ret_15m <= -0.10: score += 1; reasons.append(f"15m return negative ({ret_15m:+.2f}%)")
-
-    if st["break"]:
-        score += 1; reasons.append(f"STRUCT break ({st['level']:.2f})")
-    elif st["reclaim"]:
-        score += 1; reasons.append("STRUCT reclaim/reject EMA20")
-    else:
-        reasons.append("No structure (no break/reclaim)")
-
-    if d_ok:
-        score += 1
-        reasons.append(f"DELTA dominance ({d_msg})"
-
-                      )
-
-    dist = atr_distance(price, e20, atr)
-    reasons.append(f"ATR dist: {dist:.2f} (target early zone {EARLY_MIN_ATR:.2f}–{EARLY_MAX_SCOUT_ATR:.2f}/{EARLY_MAX_CONFIRM_ATR:.2f})")
-
-    return score, reasons
-
-def build_message_legacy(reports, title="MANUAL REPORT (ALL)"):
-    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"📊 {title}\nUTC: {ts}\n(Scanner only — NOT a signal. Use as input for analysis.)\n\n"
-
-    for r in reports:
-        sym = r["symbol"]
-        deriv = r["deriv"]
-        oi_chg = r["oi_change_pct"]
-        t15 = r["tf"]["15m"]
-
-        # legacy scoring
-        ret_15m = r["returns"]["15m"]
-        up_trg, up_reasons = trigger_score_15m_legacy(r["_tf_full"]["15m"], "UP", ret_15m)
-        dn_trg, dn_reasons = trigger_score_15m_legacy(r["_tf_full"]["15m"], "DOWN", ret_15m)
-
-        # choose direction (old MIX logic)
-        diff = up_trg - dn_trg
-        direction = "MIX" if abs(diff) <= 1 else ("UP" if diff > 0 else "DOWN")
-
-        ctx1, ctx1_r = regime_score(r["_tf_full"]["1h"], "UP")
-        ctx4, ctx4_r = regime_score(r["_tf_full"]["4h"], "UP")
-        total = ctx1 + ctx4 + max(up_trg, dn_trg)
-
-        # ranges
-        lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", candles=6)
-        lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", candles=6)
-
-        msg += (
-            f"*{sym}*  |  *DIR (15m): {direction}*  |  total `{total}` (ctx1h `{ctx1}` + ctx4h `{ctx4}` + trg `{max(up_trg,dn_trg)}`)\n"
-            f"Triggers: UP `{up_trg}` / DOWN `{dn_trg}`\n"
-            f"Deriv: mark `{fmt_num(deriv['mark'],2)}` | index `{fmt_num(deriv['index'],2)}` | funding `{fmt_num(deriv['funding'],4)}%` | "
-            f"basis `{fmt_num(deriv['basis'],4)}%` | OI `{fmt_num(deriv['oi'],0)}`"
-        )
-        if oi_chg is not None:
-            msg += f" | OIΔ `{fmt_num(oi_chg,2)}%`"
-        msg += "\n"
-
-        msg += (
-            f"RANGE: 4h(24h) low `{fmt_num(lo_4h,2)}` / high `{fmt_num(hi_4h,2)}`  |  "
-            f"1h(6h) low `{fmt_num(lo_1h,2)}` / high `{fmt_num(hi_1h,2)}`\n"
-        )
-
-        if t15.get("vol_buy") is not None:
-            msg += (
-                f"DELTA(15m): buy `{fmt_num(t15['vol_buy'],2)}` | sell `{fmt_num(t15['vol_sell'],2)}` | Δ `{fmt_num(t15['vol_delta'],2)}`\n"
-            )
-
-        # print tf lines (existing)
-        for tf in ["4h", "1h", "15m"]:
-            t = r["tf"][tf]
-            lbl = tf_trend_label(t)
-            msg += (
-                f"`{tf:>3}` [{lbl}] p `{fmt_num(t['price'],2)}` | EMA20 `{fmt_num(t['ema20'],2)}`({fmt_num(t['ema20_slp'],2)}) "
-                f"EMA50 `{fmt_num(t['ema50'],2)}`({fmt_num(t['ema50_slp'],2)}) | RSI `{fmt_num(t['rsi'],1)}`({fmt_num(t['rsi_slp'],1)}) | "
-                f"ATR `{fmt_num(t['atr'],2)}` | VOLx `{fmt_num(t['vol_ratio'],2)}` | ret `{fmt_num(r['returns'][tf],2)}%`\n"
-            )
-
-        msg += "Why flagged:\n"
-        msg += "• Context scored as: UP-ish\n"
-        msg += "• Setup (1h):\n" + "".join([f"• {x}\n" for x in ctx1_r])
-        msg += "• Setup (4h):\n" + "".join([f"• {x}\n" for x in ctx4_r])
-        msg += "• Trigger (15m):\n"
-        trg_reasons = up_reasons if up_trg >= dn_trg else dn_reasons
-        msg += "".join([f"• {x}\n" for x in trg_reasons[:10]])
-        msg += "\n"
-
-    return msg.strip()
-
+# ================== TELEGRAM COMMAND HANDLER ================== #
 
 def handle_telegram_commands():
     global _last_update_id
@@ -1086,6 +1074,7 @@ def handle_telegram_commands():
         msg = u.get("message") or {}
         chat = msg.get("chat") or {}
         chat_id = str(chat.get("id", ""))
+
         text = (msg.get("text") or "").strip()
         if not text:
             continue
@@ -1095,37 +1084,34 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v6.1 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
-                "AUTO alerts: concise\n"
-                "Manual: /report or /report ETHUSDT (FULL analysis)",
+                "v7 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
+                "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
             continue
 
         if text.startswith("/report"):
+            # IMPORTANT: this block MUST be indented (fixes your IndentationError)
             parts = text.split()
-            send_telegram("🟡 Building report…", chat_id=chat_id)
             try:
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
-                    msg = compress_report_all(reps)   # <-- ALWAYS ONE MESSAGE
-                    send_telegram(msg, chat_id=chat_id)
+                    out = build_report_all_one_message(reps)
+                    send_telegram(out, chat_id=chat_id)
                 else:
                     sym = parts[1].upper()
                     if sym not in SYMBOLS:
-                        send_telegram(
-                            f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}",
-                            chat_id=chat_id
-                        )
+                        send_telegram(f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}", chat_id=chat_id)
                         continue
                     r = analyze_symbol(sym)
-                    send_telegram(build_report_full(r, include_signal_reasons=True), chat_id=chat_id)
+                    out = build_report_oldstyle(r)
+                    send_telegram(out, chat_id=chat_id)
             except Exception as e:
                 send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
             continue
 
 
-# ---------- MAIN SCAN (AUTO PUSH) ---------- #
+# ================== MAIN SCAN (AUTO PUSH) ================== #
 
 def run_once():
     for sym in SYMBOLS:
@@ -1141,36 +1127,18 @@ def run_once():
                 mark_sent(sym, sig, rep)
 
 
-# ---------- ANTI-SPAM (continued) ---------- #
-
-def _min_move_for(symbol, level):
-    if level == "SCOUT":
-        return MIN_MOVE_SCOUT.get(symbol, 0.12)
-    if level == "PULLBACK":
-        return MIN_MOVE_PULLBACK.get(symbol, 0.18)
-    return MIN_MOVE_CONFIRM.get(symbol, 0.30)
-
-def _cooldown_for(level):
-    if level == "SCOUT":
-        return COOLDOWN_SCOUT
-    if level == "PULLBACK":
-        return COOLDOWN_PULLBACK
-    return COOLDOWN_CONFIRM
-
-
-# ---------- RUNNER ---------- #
+# ================== RUNNER ================== #
 
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         telegram_delete_webhook()
         send_telegram(
-            "✅ Momentum bot ONLINE (v6.1 MULTI-ALERT)\n"
+            "✅ Momentum bot ONLINE (v7 MULTI-ALERT + DETAILED REPORT)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
-            "- Levels: SCOUT (early/noisy), PULLBACK (entry), CONFIRM (continuation)\n"
+            "- Levels: SCOUT (early), PULLBACK (entry), CONFIRM (continuation)\n"
             "- Both sides: LONG + SHORT\n"
             f"- VOLx: scout≥{VOLX_SCOUT}, pullback≥{VOLX_PULLBACK}, confirm≥{VOLX_CONFIRM}\n"
             f"- Confirm late filter: soft {SOFT_LATE_ATR_CONFIRM} ATR, hard {LATE_ATR_BLOCK_CONFIRM} ATR\n"
-            "- /report restored to FULL detailed analysis\n"
             "Manual: /report or /report ETHUSDT"
         )
 
@@ -1186,6 +1154,3 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ Runtime error\n{e}")
         time.sleep(CMD_POLL_SECONDS)
-
-
-
