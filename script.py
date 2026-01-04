@@ -1,6 +1,8 @@
 """
-MOMENTUM PRO – MULTI-ALERT (Telegram Enabled, SAFE) — v6.0 FIXED
+MOMENTUM PRO – MULTI-ALERT (Telegram Enabled, SAFE) — v6.1 FIXED
 SCOUT + PULLBACK + CONFIRM, LONG/SHORT
+- AUTO alerts: concise
+- /report: FULL detailed analysis (as before)
 Scanner only — NOT a trade signal.
 """
 
@@ -158,6 +160,7 @@ def send_telegram(message: str, chat_id: str | None = None):
     if not target:
         return
 
+    # Telegram hard-ish safe limit
     if message and len(message) > 3900:
         message = message[:3900] + "\n…(truncated)"
 
@@ -423,6 +426,24 @@ def _intent_candle(tf15):
         return False
     return abs(float(body)) >= (BODY_ATR_MIN * float(atr))
 
+def _delta_sign_ok(tf15, side):
+    """
+    CONFIRM should not fight current taker flow.
+    LONG -> delta >= 0
+    SHORT -> delta <= 0
+    If delta n/a -> allow (neutral).
+    """
+    d = tf15.get("vol_delta")
+    if d is None:
+        return True
+    try:
+        d = float(d)
+    except Exception:
+        return True
+    if side == "LONG":
+        return d >= 0
+    return d <= 0
+
 
 # ---------- SIGNAL LOGIC ---------- #
 
@@ -512,6 +533,12 @@ def _pullback_signal(tf15, symbol, side):
     return {"level": "PULLBACK", "side": side, "reasons": reasons}
 
 def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
+    """
+    v6.1 FIX:
+    - CONFIRM MUST have structure (break OR reclaim/reject)
+    - CONFIRM LONG must not be below EMA20
+    - CONFIRM must respect delta sign (LONG delta>=0, SHORT delta<=0) when available
+    """
     reasons = []
     price = tf15["price"]
     e20 = tf15["ema20"]
@@ -527,9 +554,28 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
         return None
 
     st = _structure_flags_15m(tf15, side)
+
+    # HARD: confirm must have structure (no more "STRUCT none" confirm)
+    if not (st["break"] or st["reclaim"]):
+        return None
+
+    # Soft late: if already stretched, require an actual break (not just reclaim)
     if dist >= SOFT_LATE_ATR_CONFIRM and not st["break"]:
         return None
 
+    # Price location sanity for confirm
+    if side == "LONG":
+        if price < e20:
+            return None
+    else:
+        if price > e20:
+            return None
+
+    # Delta sign sanity (prevents exactly what you showed on SOL)
+    if not _delta_sign_ok(tf15, side):
+        return None
+
+    # HTF regime check
     if side == "LONG":
         if rsi1h < RSI_CONFIRM_LONG:
             return None
@@ -548,14 +594,18 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
     reasons.append(f"RSI(1h) confirm ({rsi1h:.1f})")
     reasons.append(f"distEMA20 {dist:.2f} ATR (<= {LATE_ATR_BLOCK_CONFIRM:.2f})")
     reasons.append(f"ret15 ({ret15:+.2f}%)")
+
     if st["break"]:
         reasons.append(f"STRUCT break ({st['level']:.2f})")
-    elif st["reclaim"]:
-        reasons.append("STRUCT reclaim/reject EMA20")
     else:
-        reasons.append("STRUCT none")
+        reasons.append("STRUCT reclaim/reject EMA20")
+
     if d_ok:
         reasons.append(f"DELTA ok ({d_msg})")
+    else:
+        # still show why, but signal already passed delta sign sanity
+        reasons.append(f"DELTA not dom ({d_msg})")
+
     if intent:
         reasons.append("Intent candle")
 
@@ -674,6 +724,14 @@ def mark_sent(symbol, signal, report):
 
 # ---------- MESSAGE FORMAT ---------- #
 
+def fmt_num(x, digits=2):
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return "n/a"
+        return f"{x:.{digits}f}"
+    except Exception:
+        return "n/a"
+
 def tf_trend_label(snap):
     price, e20, e50 = snap["price"], snap["ema20"], snap["ema50"]
     if price > e20 and e20 > e50:
@@ -683,7 +741,6 @@ def tf_trend_label(snap):
     return "MIX"
 
 def range_snapshot_from_klines(symbol, tf, candles: int):
-    # uses cached klines
     k = get_klines_cached(symbol, tf)
     if k is None or len(k) < candles:
         return None, None
@@ -694,7 +751,7 @@ def range_snapshot_from_klines(symbol, tf, candles: int):
 
 def build_report_full(report, include_signal_reasons=True):
     """
-    FULL /report output (detailed) — keeps all analysis data.
+    FULL /report output (detailed) — restores the previous "analysis report" feel.
     """
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     sym = report["symbol"]
@@ -705,7 +762,6 @@ def build_report_full(report, include_signal_reasons=True):
     t1h = report["tf"]["1h"]
     t4h = report["tf"]["4h"]
 
-    # ranges: 4h last 6 candles (~24h), 1h last 6 candles (~6h)
     lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", candles=6)
     lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", candles=6)
 
@@ -736,7 +792,6 @@ def build_report_full(report, include_signal_reasons=True):
             f"Δ {fmt_num(t15['vol_delta'],2)}\n"
         )
 
-    # Per-TF detailed lines (like your old v5.x style)
     def tf_line(tf_name, t, lbl):
         return (
             f"{tf_name:>3} [{lbl}] "
@@ -754,24 +809,15 @@ def build_report_full(report, include_signal_reasons=True):
     msg += tf_line("15m", t15, lbl15)
     msg += "\n"
 
-    # Signals list + reasons (full)
     sigs = report.get("signals", [])
     msg += f"Signals found: {len(sigs)}\n"
     for s in sigs:
         msg += f"- {s['level']} {s['side']}\n"
         if include_signal_reasons:
-            for r in s.get("reasons", [])[:12]:
+            for r in s.get("reasons", [])[:14]:
                 msg += f"  • {r}\n"
+
     return msg.strip()
-
-
-def fmt_num(x, digits=2):
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return "n/a"
-        return f"{x:.{digits}f}"
-    except Exception:
-        return "n/a"
 
 def build_signal_message(report, signal):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -812,6 +858,28 @@ def build_signal_message(report, signal):
 
 # ---------- MANUAL COMMAND HANDLER ---------- #
 
+def _send_long_text(chat_id: str, text: str):
+    """
+    Sends long text in safe chunks, preserving readability.
+    """
+    if len(text) <= 3900:
+        send_telegram(text, chat_id=chat_id)
+        return
+
+    chunks = []
+    buf = ""
+    for line in text.splitlines(True):
+        if len(buf) + len(line) > 3800:
+            chunks.append(buf)
+            buf = ""
+        buf += line
+    if buf:
+        chunks.append(buf)
+
+    for c in chunks:
+        send_telegram(c.strip(), chat_id=chat_id)
+        time.sleep(0.3)
+
 def handle_telegram_commands():
     global _last_update_id
     if not TELEGRAM_TOKEN:
@@ -835,8 +903,9 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v6 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
-                "Manual: /report or /report ETHUSDT",
+                "v6.1 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
+                "AUTO alerts: concise\n"
+                "Manual: /report or /report ETHUSDT (FULL analysis)",
                 chat_id=chat_id
             )
             continue
@@ -847,23 +916,19 @@ def handle_telegram_commands():
             try:
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
-                    out = "📊 MANUAL REPORT (ALL)\n\n"
+                    # FULL report for ALL — send per symbol (safe + readable)
                     for r in reps:
-                        out += f"{r['symbol']}: signals={len(r['signals'])}\n"
-                        for sig in r["signals"][:8]:
-                            out += f"  - {sig['level']} {sig['side']}\n"
-                        out += "\n"
-                    send_telegram(out.strip(), chat_id=chat_id)
+                        _send_long_text(chat_id, build_report_full(r))
+                        send_telegram("—" * 22, chat_id=chat_id)
+                    continue
                 else:
                     sym = parts[1].upper()
                     if sym not in SYMBOLS:
                         send_telegram(f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}", chat_id=chat_id)
                         continue
                     r = analyze_symbol(sym)
-                    out = f"📊 MANUAL REPORT ({sym})\n\nsignals={len(r['signals'])}\n"
-                    for sig in r["signals"][:12]:
-                        out += f"- {sig['level']} {sig['side']}\n"
-                    send_telegram(out.strip(), chat_id=chat_id)
+                    _send_long_text(chat_id, build_report_full(r))
+                    continue
             except Exception as e:
                 send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
             continue
@@ -885,18 +950,36 @@ def run_once():
                 mark_sent(sym, sig, rep)
 
 
+# ---------- ANTI-SPAM (continued) ---------- #
+
+def _min_move_for(symbol, level):
+    if level == "SCOUT":
+        return MIN_MOVE_SCOUT.get(symbol, 0.12)
+    if level == "PULLBACK":
+        return MIN_MOVE_PULLBACK.get(symbol, 0.18)
+    return MIN_MOVE_CONFIRM.get(symbol, 0.30)
+
+def _cooldown_for(level):
+    if level == "SCOUT":
+        return COOLDOWN_SCOUT
+    if level == "PULLBACK":
+        return COOLDOWN_PULLBACK
+    return COOLDOWN_CONFIRM
+
+
 # ---------- RUNNER ---------- #
 
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         telegram_delete_webhook()
         send_telegram(
-            "✅ Momentum bot ONLINE (v6 MULTI-ALERT)\n"
+            "✅ Momentum bot ONLINE (v6.1 MULTI-ALERT)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
             "- Levels: SCOUT (early/noisy), PULLBACK (entry), CONFIRM (continuation)\n"
             "- Both sides: LONG + SHORT\n"
             f"- VOLx: scout≥{VOLX_SCOUT}, pullback≥{VOLX_PULLBACK}, confirm≥{VOLX_CONFIRM}\n"
             f"- Confirm late filter: soft {SOFT_LATE_ATR_CONFIRM} ATR, hard {LATE_ATR_BLOCK_CONFIRM} ATR\n"
+            "- /report restored to FULL detailed analysis\n"
             "Manual: /report or /report ETHUSDT"
         )
 
@@ -912,4 +995,3 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ Runtime error\n{e}")
         time.sleep(CMD_POLL_SECONDS)
-
