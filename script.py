@@ -1,16 +1,7 @@
 """
-MOMENTUM PRO – MULTI-ALERT (Telegram Enabled, SAFE) — v6.0 (SCOUT + PULLBACK + CONFIRM, LONG/SHORT)
-GOAL:
-- Scanner only (NOT a trade signal). Runs continuously.
-- More alerts (you want early/noisy) because you forward alerts to me and I filter.
-- Captures BOTH directions: LONG + SHORT.
-- Three levels:
-  A) SCOUT (early, noisy, no late-filter)
-  B) PULLBACK (best RR entry: touch/reject EMA20 after a scout/confirm)
-  C) CONFIRM (continuation/add, has late-filter to avoid chase)
-
-NOTES:
-- Do not paste secrets. Use env vars TELEGRAM_TOKEN and TELEGRAM_CHAT_ID.
+MOMENTUM PRO – MULTI-ALERT (Telegram Enabled, SAFE) — v6.0 FIXED
+SCOUT + PULLBACK + CONFIRM, LONG/SHORT
+Scanner only — NOT a trade signal.
 """
 
 import os
@@ -38,46 +29,37 @@ RETURN_LOOKBACK_15M = 6
 RETURN_LOOKBACK_1H = 6
 RETURN_LOOKBACK_4H = 6
 
-# --- SCOUT / PULLBACK / CONFIRM thresholds ---
+# --- thresholds ---
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
 VOLX_CONFIRM = 1.10
 
-# RSI thresholds
 RSI_SCOUT_LONG = 52
 RSI_SCOUT_SHORT = 48
 RSI_CONFIRM_LONG = 58
 RSI_CONFIRM_SHORT = 42
 
-# Structure / breakout window (15m)
-SWING_LOOKBACK = 5  # prior candles only
+SWING_LOOKBACK = 5
 
-# Delta dominance + candle intent
 DELTA_MED_LOOKBACK = 20
 DELTA_DOM_MULT = 1.15
 BODY_ATR_MIN = 0.35
 
-# Pullback touch band (distance to EMA20 in ATR)
-PULLBACK_TOUCH_ATR = 0.30  # abs(price-EMA20) <= 0.30*ATR triggers touch zone
-PULLBACK_LOOKBACK_SEC = 2 * 60 * 60  # only allow pullback if there was Scout/Confirm in last 2h
+PULLBACK_TOUCH_ATR = 0.30
+PULLBACK_LOOKBACK_SEC = 2 * 60 * 60
 
-# Late filter for CONFIRM only
-LATE_ATR_BLOCK_CONFIRM = 1.60   # block confirm if too far
-SOFT_LATE_ATR_CONFIRM = 1.10    # beyond this require breakout/breakdown
+LATE_ATR_BLOCK_CONFIRM = 1.60
+SOFT_LATE_ATR_CONFIRM = 1.10
 
-# Anti-spam / cadence
 SCAN_SECONDS = 60
 CMD_POLL_SECONDS = 5
 
-# Cooldowns (per symbol, per side, per level)
-COOLDOWN_SCOUT = 12 * 60        # 12 min
-COOLDOWN_PULLBACK = 35 * 60     # 35 min
-COOLDOWN_CONFIRM = 60 * 60      # 60 min
+COOLDOWN_SCOUT = 12 * 60
+COOLDOWN_PULLBACK = 35 * 60
+COOLDOWN_CONFIRM = 60 * 60
 
-# Candle gating (avoid duplicates on same 15m candle)
 ONE_PER_CANDLE = True
 
-# Meaningful move since last alert (per symbol) - lighter for Scout, stricter for Confirm
 MIN_MOVE_SCOUT = {"BTCUSDT": 0.10, "ETHUSDT": 0.14, "SOLUSDT": 0.18}
 MIN_MOVE_PULLBACK = {"BTCUSDT": 0.15, "ETHUSDT": 0.20, "SOLUSDT": 0.25}
 MIN_MOVE_CONFIRM = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
@@ -101,18 +83,15 @@ KLINE_TAIL_FETCH = 2
 _last_update_id = 0
 _prev_oi = {}
 
-# last sent tracking:
-# key: (symbol, side, level) -> {"ts": float, "price": float, "candle_ot": int}
-_last_sent = {}
-_last_15m_candle_by_key = {}     # (symbol, side, level) -> candle open_time
-_last_alert_price_by_key = {}    # (symbol, side, level) -> last price
+_last_sent = {}                   # (symbol, side, level) -> {"ts":..., "price":..., "candle_ot":...}
+_last_15m_candle_by_key = {}      # (symbol, side, level) -> open_time
+_last_alert_price_by_key = {}     # (symbol, side, level) -> price
+_last_impulse = {}                # (symbol, side) -> {"ts":..., "level":..., "price":...}
 
-# last scout/confirm time per symbol+side (for pullback eligibility)
-_last_impulse = {}  # (symbol, side) -> {"ts": float, "level": "SCOUT"/"CONFIRM", "price": float}
-
-_KLINE_CACHE = {}     # (symbol, tf) -> np.array of klines float
-_DERIV_CACHE = {}     # symbol -> (ts, deriv_dict)
+_KLINE_CACHE = {}                 # (symbol, tf) -> np.array
+_DERIV_CACHE = {}                 # symbol -> (ts, dict)
 DERIV_TTL_SEC = 30
+
 
 # ---------- RATE LIMIT HELPERS ---------- #
 
@@ -139,6 +118,7 @@ def _should_backoff(resp, json_data):
 def _sleep_backoff(attempt):
     s = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt))
     time.sleep(s)
+
 
 # ---------- NETWORK HELPERS ---------- #
 
@@ -167,6 +147,7 @@ def http_get_json(url, params=None, timeout=10):
             if attempt == 4:
                 raise
             _sleep_backoff(attempt)
+
 
 # ---------- TELEGRAM ---------- #
 
@@ -208,6 +189,7 @@ def telegram_get_updates(offset=None, timeout=0):
 
 def is_allowed_chat(chat_id: str) -> bool:
     return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
 
 # ---------- INDICATORS ---------- #
 
@@ -263,6 +245,7 @@ def atr_distance(price, ema20, atr):
     if atr is None or (isinstance(atr, float) and np.isnan(atr)) or atr <= 0:
         return 0.0
     return abs(price - ema20) / atr
+
 
 # ---------- BINANCE DATA (INCREMENTAL) ---------- #
 
@@ -320,11 +303,10 @@ def fetch_derivatives_cached(symbol):
     _DERIV_CACHE[symbol] = (now, d)
     return d
 
+
 # ---------- SNAPSHOT ---------- #
 
 def tf_snapshot(k, tf_name):
-    # Binance kline columns:
-    # 0 open_time, 1 open, 2 high, 3 low, 4 close, 5 volume, 9 taker_buy_base_asset_volume
     op = k[:, 1]
     close = k[:, 4]
     high = k[:, 2]
@@ -389,14 +371,6 @@ def tf_snapshot(k, tf_name):
         "low_series": low,
     }
 
-def tf_trend_label(snap):
-    price, e20, e50 = snap["price"], snap["ema20"], snap["ema50"]
-    if price > e20 and e20 > e50:
-        return "UP"
-    if price < e20 and e20 < e50:
-        return "DOWN"
-    return "MIX"
-
 def compute_returns(tf_snaps):
     out = {}
     for tf, snap in tf_snaps.items():
@@ -405,16 +379,10 @@ def compute_returns(tf_snaps):
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
 
-# ---------- HELPERS (structure / aggression) ---------- #
+
+# ---------- HELPERS ---------- #
 
 def _structure_flags_15m(tf15, side):
-    """
-    side: "LONG" or "SHORT"
-    - Breakout: close > max(high[-SWING_LOOKBACK-1:-1])
-    - Breakdown: close < min(low[-SWING_LOOKBACK-1:-1])
-    - Reclaim: prev_close <= EMA20 and now_close > EMA20  (LONG)
-    - Reject:  prev_close >= EMA20 and now_close < EMA20  (SHORT)
-    """
     close = tf15["close_series"]
     high = tf15["high_series"]
     low = tf15["low_series"]
@@ -455,13 +423,10 @@ def _intent_candle(tf15):
         return False
     return abs(float(body)) >= (BODY_ATR_MIN * float(atr))
 
-# ---------- SIGNAL LOGIC (v6) ---------- #
+
+# ---------- SIGNAL LOGIC ---------- #
 
 def _scout_signal(tf15, tf1h, side, ret15):
-    """
-    EARLY SCOUT: noisy by design.
-    No late filter.
-    """
     reasons = []
     price = tf15["price"]
     e20 = tf15["ema20"]
@@ -472,7 +437,6 @@ def _scout_signal(tf15, tf1h, side, ret15):
     d_ok, d_msg = _delta_dominance(tf15)
     intent = _intent_candle(tf15)
 
-    # Base gates
     if volx < VOLX_SCOUT:
         return None
 
@@ -487,7 +451,6 @@ def _scout_signal(tf15, tf1h, side, ret15):
         if not (price < e20 or ret15 <= -0.35):
             return None
 
-    # Compose
     reasons.append(f"VOLx>=SCOUT ({volx:.2f}x)")
     reasons.append(f"RSI(1h) ok ({rsi1h:.1f})")
     reasons.append(f"ret15 ({ret15:+.2f}%)")
@@ -497,24 +460,14 @@ def _scout_signal(tf15, tf1h, side, ret15):
         reasons.append("STRUCT reclaim/reject EMA20")
     else:
         reasons.append("STRUCT none (allowed for SCOUT)")
-
     if d_ok:
         reasons.append(f"DELTA ok ({d_msg})")
     if intent:
         reasons.append("Intent candle")
 
-    return {
-        "level": "SCOUT",
-        "side": side,
-        "reasons": reasons,
-        "structure": st
-    }
+    return {"level": "SCOUT", "side": side, "reasons": reasons}
 
 def _pullback_signal(tf15, symbol, side):
-    """
-    PULLBACK entry: needs recent impulse (Scout/Confirm) in same side within 2h,
-    then touch EMA20 zone and reject back in direction.
-    """
     key_imp = (symbol, side)
     imp = _last_impulse.get(key_imp)
     if not imp or (time.time() - imp["ts"] > PULLBACK_LOOKBACK_SEC):
@@ -532,7 +485,6 @@ def _pullback_signal(tf15, symbol, side):
     if dist > PULLBACK_TOUCH_ATR:
         return None
 
-    # reject candle logic using current candle body direction and position relative to EMA20
     op = tf15["open"]
     cl = tf15["price"]
 
@@ -547,8 +499,6 @@ def _pullback_signal(tf15, symbol, side):
     intent = _intent_candle(tf15)
 
     reasons = [
-/km
-    reasons = [
         f"Recent impulse: {imp['level']} ({int((time.time()-imp['ts'])/60)}m ago)",
         f"Touch EMA20 zone: dist {dist:.2f} ATR <= {PULLBACK_TOUCH_ATR:.2f}",
         f"Reject candle ok (side={side})",
@@ -559,17 +509,9 @@ def _pullback_signal(tf15, symbol, side):
     if intent:
         reasons.append("Intent candle")
 
-    return {
-        "level": "PULLBACK",
-        "side": side,
-        "reasons": reasons,
-        "structure": None
-    }
+    return {"level": "PULLBACK", "side": side, "reasons": reasons}
 
 def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
-    """
-    CONFIRM: continuation/add, protected with late filters.
-    """
     reasons = []
     price = tf15["price"]
     e20 = tf15["ema20"]
@@ -585,16 +527,12 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
         return None
 
     st = _structure_flags_15m(tf15, side)
-
-    # Soft late: if far, require break
     if dist >= SOFT_LATE_ATR_CONFIRM and not st["break"]:
         return None
 
-    # RSI confirm
     if side == "LONG":
         if rsi1h < RSI_CONFIRM_LONG:
             return None
-        # trend filter (light): 1h or 4h alignment
         if not (tf1h["ema20"] > tf1h["ema50"] or tf4h["ema20"] > tf4h["ema50"]):
             return None
     else:
@@ -610,34 +548,26 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
     reasons.append(f"RSI(1h) confirm ({rsi1h:.1f})")
     reasons.append(f"distEMA20 {dist:.2f} ATR (<= {LATE_ATR_BLOCK_CONFIRM:.2f})")
     reasons.append(f"ret15 ({ret15:+.2f}%)")
-
     if st["break"]:
         reasons.append(f"STRUCT break ({st['level']:.2f})")
     elif st["reclaim"]:
         reasons.append("STRUCT reclaim/reject EMA20")
     else:
         reasons.append("STRUCT none")
-
     if d_ok:
         reasons.append(f"DELTA ok ({d_msg})")
     if intent:
         reasons.append("Intent candle")
 
-    return {
-        "level": "CONFIRM",
-        "side": side,
-        "reasons": reasons,
-        "structure": st
-    }
+    return {"level": "CONFIRM", "side": side, "reasons": reasons}
+
 
 # ---------- ANALYSIS ---------- #
 
 def analyze_symbol(symbol):
     tf_snaps = {}
-    klines = {}
     for tf in TIMEFRAMES.keys():
         k = get_klines_cached(symbol, tf)
-        klines[tf] = k
         tf_snaps[tf] = tf_snapshot(k, tf)
 
     returns = compute_returns(tf_snaps)
@@ -648,52 +578,41 @@ def analyze_symbol(symbol):
     oi_change_pct = pct_change(deriv["oi"], prev_oi) if prev_oi and prev_oi > 0 else None
     _prev_oi[symbol] = deriv["oi"]
 
-    # generate potential signals (up to 6: 3 levels x 2 sides)
     signals = []
 
-    # SCOUT both sides
     s_long = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "LONG", ret_15m)
-    if s_long:
-        signals.append(s_long)
+    if s_long: signals.append(s_long)
 
     s_short = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "SHORT", ret_15m)
-    if s_short:
-        signals.append(s_short)
+    if s_short: signals.append(s_short)
 
-    # PULLBACK both sides
     pb_long = _pullback_signal(tf_snaps["15m"], symbol, "LONG")
-    if pb_long:
-        signals.append(pb_long)
+    if pb_long: signals.append(pb_long)
 
     pb_short = _pullback_signal(tf_snaps["15m"], symbol, "SHORT")
-    if pb_short:
-        signals.append(pb_short)
+    if pb_short: signals.append(pb_short)
 
-    # CONFIRM both sides
     c_long = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "LONG", ret_15m)
-    if c_long:
-        signals.append(c_long)
+    if c_long: signals.append(c_long)
 
     c_short = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "SHORT", ret_15m)
-    if c_short:
-        signals.append(c_short)
+    if c_short: signals.append(c_short)
 
-    # Public tf snaps (remove big series)
-    tf_public = {k: {kk: vv for kk, vv in v.items()
-                     if kk not in ("close_series", "high_series", "low_series", "delta_series")}
-                 for k, v in tf_snaps.items()}
-
-    trend_labels = {tf: tf_trend_label(tf_snaps[tf]) for tf in tf_snaps.keys()}
+    tf_public = {
+        k: {kk: vv for kk, vv in v.items()
+            if kk not in ("close_series", "high_series", "low_series", "delta_series")}
+        for k, v in tf_snaps.items()
+    }
 
     return {
         "symbol": symbol,
         "signals": signals,
         "tf": tf_public,
         "returns": returns,
-        "trend_labels": trend_labels,
         "deriv": deriv,
-        "oi_change_pct": oi_change_pct
+        "oi_change_pct": oi_change_pct,
     }
+
 
 # ---------- ANTI-SPAM / GATING ---------- #
 
@@ -712,26 +631,17 @@ def _cooldown_for(level):
     return COOLDOWN_CONFIRM
 
 def allowed_to_send(symbol, signal, report):
-    """
-    key: (symbol, side, level)
-    - One per new 15m candle per key (optional)
-    - Cooldown per key
-    - Meaningful move per key
-    - Upgrade rule: CONFIRM can bypass SCOUT cooldown (same side) if last was SCOUT
-    """
     side = signal["side"]
     level = signal["level"]
     key = (symbol, side, level)
     now = time.time()
 
-    # per-candle gating
     if ONE_PER_CANDLE:
         candle_ot = report["tf"]["15m"]["open_time"]
         last_candle = _last_15m_candle_by_key.get(key)
         if last_candle is not None and candle_ot == last_candle:
             return False
 
-    # min move gating (per key)
     curr_price = report["tf"]["15m"]["price"]
     last_price = _last_alert_price_by_key.get(key)
     if last_price is not None and last_price > 0:
@@ -743,12 +653,8 @@ def allowed_to_send(symbol, signal, report):
     if prev is None:
         return True
 
-    # cooldown per level
     cd = _cooldown_for(level)
-    if now - prev["ts"] >= cd:
-        return True
-
-    return False
+    return (now - prev["ts"]) >= cd
 
 def mark_sent(symbol, signal, report):
     side = signal["side"]
@@ -762,9 +668,9 @@ def mark_sent(symbol, signal, report):
     _last_15m_candle_by_key[key] = candle_ot
     _last_alert_price_by_key[key] = float(price)
 
-    # If SCOUT or CONFIRM, store impulse to enable pullback
     if level in ("SCOUT", "CONFIRM"):
         _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(price)}
+
 
 # ---------- MESSAGE FORMAT ---------- #
 
@@ -789,7 +695,6 @@ def build_signal_message(report, signal):
     t1h = report["tf"]["1h"]
     t4h = report["tf"]["4h"]
 
-    # compact but complete
     msg = f"🚨 {sym} — {level} | {side}\nUTC: {ts}\n"
     msg += "(Scanner only — NOT a signal. Forward to filter.)\n\n"
 
@@ -812,6 +717,7 @@ def build_signal_message(report, signal):
         msg += f"- {line}\n"
 
     return msg.strip()
+
 
 # ---------- MANUAL COMMAND HANDLER ---------- #
 
@@ -850,12 +756,10 @@ def handle_telegram_commands():
             try:
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
-                    # Show only brief signals summary
                     out = "📊 MANUAL REPORT (ALL)\n\n"
                     for r in reps:
-                        sym = r["symbol"]
-                        out += f"{sym}: signals={len(r['signals'])}\n"
-                        for sig in r["signals"][:6]:
+                        out += f"{r['symbol']}: signals={len(r['signals'])}\n"
+                        for sig in r["signals"][:8]:
                             out += f"  - {sig['level']} {sig['side']}\n"
                         out += "\n"
                     send_telegram(out.strip(), chat_id=chat_id)
@@ -866,12 +770,13 @@ def handle_telegram_commands():
                         continue
                     r = analyze_symbol(sym)
                     out = f"📊 MANUAL REPORT ({sym})\n\nsignals={len(r['signals'])}\n"
-                    for sig in r["signals"][:10]:
+                    for sig in r["signals"][:12]:
                         out += f"- {sig['level']} {sig['side']}\n"
                     send_telegram(out.strip(), chat_id=chat_id)
             except Exception as e:
                 send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
             continue
+
 
 # ---------- MAIN SCAN (AUTO PUSH) ---------- #
 
@@ -883,11 +788,11 @@ def run_once():
             send_telegram(f"⚠️ Symbol error {sym}\n{e}")
             continue
 
-        # send each eligible signal
         for sig in rep["signals"]:
             if allowed_to_send(sym, sig, rep):
                 send_telegram(build_signal_message(rep, sig))
                 mark_sent(sym, sig, rep)
+
 
 # ---------- RUNNER ---------- #
 
