@@ -674,6 +674,97 @@ def mark_sent(symbol, signal, report):
 
 # ---------- MESSAGE FORMAT ---------- #
 
+def tf_trend_label(snap):
+    price, e20, e50 = snap["price"], snap["ema20"], snap["ema50"]
+    if price > e20 and e20 > e50:
+        return "UP"
+    if price < e20 and e20 < e50:
+        return "DOWN"
+    return "MIX"
+
+def range_snapshot_from_klines(symbol, tf, candles: int):
+    # uses cached klines
+    k = get_klines_cached(symbol, tf)
+    if k is None or len(k) < candles:
+        return None, None
+    tail = k[-candles:]
+    lo = float(np.min(tail[:, 3]))
+    hi = float(np.max(tail[:, 2]))
+    return lo, hi
+
+def build_report_full(report, include_signal_reasons=True):
+    """
+    FULL /report output (detailed) — keeps all analysis data.
+    """
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    sym = report["symbol"]
+    deriv = report["deriv"]
+    oi_chg = report["oi_change_pct"]
+
+    t15 = report["tf"]["15m"]
+    t1h = report["tf"]["1h"]
+    t4h = report["tf"]["4h"]
+
+    # ranges: 4h last 6 candles (~24h), 1h last 6 candles (~6h)
+    lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", candles=6)
+    lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", candles=6)
+
+    lbl15 = tf_trend_label(t15)
+    lbl1h = tf_trend_label(t1h)
+    lbl4h = tf_trend_label(t4h)
+
+    msg = f"📊 MANUAL REPORT ({sym})\nUTC: {ts}\n"
+    msg += "(Scanner only — NOT a signal. Use as input for analysis.)\n\n"
+
+    msg += (
+        f"Deriv: mark {fmt_num(deriv['mark'],2)} | index {fmt_num(deriv['index'],2)} | "
+        f"funding {fmt_num(deriv['funding'],4)}% | basis {fmt_num(deriv['basis'],4)}% | "
+        f"OI {fmt_num(deriv['oi'],0)}"
+    )
+    if oi_chg is not None:
+        msg += f" | OIΔ {fmt_num(oi_chg,2)}%"
+    msg += "\n"
+
+    msg += (
+        f"RANGE: 4h(24h) low {fmt_num(lo_4h,2)} / high {fmt_num(hi_4h,2)}  |  "
+        f"1h(6h) low {fmt_num(lo_1h,2)} / high {fmt_num(hi_1h,2)}\n"
+    )
+
+    if t15.get("vol_buy") is not None:
+        msg += (
+            f"DELTA(15m): buy {fmt_num(t15['vol_buy'],2)} | sell {fmt_num(t15['vol_sell'],2)} | "
+            f"Δ {fmt_num(t15['vol_delta'],2)}\n"
+        )
+
+    # Per-TF detailed lines (like your old v5.x style)
+    def tf_line(tf_name, t, lbl):
+        return (
+            f"{tf_name:>3} [{lbl}] "
+            f"p {fmt_num(t['price'],2)} | "
+            f"EMA20 {fmt_num(t['ema20'],2)}({fmt_num(t['ema20_slp'],2)}) "
+            f"EMA50 {fmt_num(t['ema50'],2)}({fmt_num(t['ema50_slp'],2)}) | "
+            f"RSI {fmt_num(t['rsi'],1)}({fmt_num(t['rsi_slp'],1)}) | "
+            f"ATR {fmt_num(t['atr'],2)} | "
+            f"VOLx {fmt_num(t['vol_ratio'],2)} | "
+            f"ret {fmt_num(report['returns'][tf_name],2)}%\n"
+        )
+
+    msg += tf_line("4h", t4h, lbl4h)
+    msg += tf_line("1h", t1h, lbl1h)
+    msg += tf_line("15m", t15, lbl15)
+    msg += "\n"
+
+    # Signals list + reasons (full)
+    sigs = report.get("signals", [])
+    msg += f"Signals found: {len(sigs)}\n"
+    for s in sigs:
+        msg += f"- {s['level']} {s['side']}\n"
+        if include_signal_reasons:
+            for r in s.get("reasons", [])[:12]:
+                msg += f"  • {r}\n"
+    return msg.strip()
+
+
 def fmt_num(x, digits=2):
     try:
         if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -821,3 +912,4 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ Runtime error\n{e}")
         time.sleep(CMD_POLL_SECONDS)
+
