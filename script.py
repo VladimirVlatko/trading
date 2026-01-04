@@ -169,22 +169,39 @@ def send_telegram(message: str, chat_id: str | None = None):
     if not TELEGRAM_TOKEN:
         return
     target = chat_id if chat_id is not None else TELEGRAM_CHAT_ID
-    if not target:
+    if not target or not message:
         return
 
-    # Telegram limit is 4096. Keep safe margin.
-    if message and len(message) > 3900:
-        message = message[:3900] + "\n…(truncated)"
-
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": str(target),
-        "text": message,
-        "disable_web_page_preview": True
-    }
-    resp = requests.post(url, json=payload, timeout=10)
-    if resp.status_code >= 400:
-        raise Exception(f"Telegram error {resp.status_code}: {resp.text[:500]}")
+
+    MAX_LEN = 3900  # safe margin under Telegram 4096 limit
+
+    lines = message.split("\n")
+    chunks = []
+    current = ""
+
+    for line in lines:
+        # +1 for the newline that will be re-added
+        if len(current) + len(line) + 1 <= MAX_LEN:
+            current += line + "\n"
+        else:
+            chunks.append(current.rstrip())
+            current = line + "\n"
+
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    for part in chunks:
+        payload = {
+            "chat_id": str(target),
+            "text": part,
+            "disable_web_page_preview": True
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            raise Exception(
+                f"Telegram error {resp.status_code}: {resp.text[:500]}"
+            )
 
 def telegram_delete_webhook():
     if not TELEGRAM_TOKEN:
@@ -1154,3 +1171,4 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ Runtime error\n{e}")
         time.sleep(CMD_POLL_SECONDS)
+
