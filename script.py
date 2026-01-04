@@ -880,6 +880,70 @@ def _send_long_text(chat_id: str, text: str):
         send_telegram(c.strip(), chat_id=chat_id)
         time.sleep(0.3)
 
+TG_LIMIT = 3900  # safe cap
+
+def build_report_all_one_message(reps):
+    out = "📊 MANUAL REPORT (ALL)\n\n"
+    for i, r in enumerate(reps, 1):
+        out += build_report_full(r, include_signal_reasons=True)
+        if i != len(reps):
+            out += "\n\n" + "—" * 20 + "\n\n"
+    return out
+
+def compress_report_all(reps):
+    # 1) Try full
+    msg = build_report_all_one_message(reps)
+    if len(msg) <= TG_LIMIT:
+        return msg
+
+    # 2) Remove signal reasons
+    out = "📊 MANUAL REPORT (ALL)\n\n"
+    for i, r in enumerate(reps, 1):
+        out += build_report_full(r, include_signal_reasons=False)
+        if i != len(reps):
+            out += "\n\n" + "—" * 20 + "\n\n"
+    msg = out
+    if len(msg) <= TG_LIMIT:
+        return msg
+
+    # 3) Hard compress – keep core analysis
+    out = "📊 MANUAL REPORT (ALL)\n\n"
+    for i, r in enumerate(reps, 1):
+        sym = r["symbol"]
+        deriv = r["deriv"]
+        oi_chg = r["oi_change_pct"]
+        t15 = r["tf"]["15m"]; t1h = r["tf"]["1h"]; t4h = r["tf"]["4h"]
+
+        lo_4h, hi_4h = range_snapshot_from_klines(sym, "4h", 6)
+        lo_1h, hi_1h = range_snapshot_from_klines(sym, "1h", 6)
+
+        out += f"📊 {sym}\n"
+        out += (
+            f"Deriv: mark {fmt_num(deriv['mark'],2)} | funding {fmt_num(deriv['funding'],4)}% | "
+            f"basis {fmt_num(deriv['basis'],4)}% | OI {fmt_num(deriv['oi'],0)}"
+        )
+        if oi_chg is not None:
+            out += f" | OIΔ {fmt_num(oi_chg,2)}%"
+        out += "\n"
+        out += (
+            f"RANGE 4h: {fmt_num(lo_4h,2)}–{fmt_num(hi_4h,2)} | "
+            f"1h: {fmt_num(lo_1h,2)}–{fmt_num(hi_1h,2)}\n"
+        )
+        out += (
+            f"4h p {fmt_num(t4h['price'],2)} RSI {fmt_num(t4h['rsi'],1)} | "
+            f"1h p {fmt_num(t1h['price'],2)} RSI {fmt_num(t1h['rsi'],1)} | "
+            f"15m p {fmt_num(t15['price'],2)} RSI {fmt_num(t15['rsi'],1)}\n"
+        )
+        out += f"Signals found: {len(r['signals'])}\n"
+
+        if i != len(reps):
+            out += "\n" + "—" * 20 + "\n\n"
+
+    if len(out) > TG_LIMIT:
+        out = out[:TG_LIMIT - 60] + "\n…(truncated to fit Telegram limit)"
+    return out
+
+
 def handle_telegram_commands():
     global _last_update_id
     if not TELEGRAM_TOKEN:
@@ -911,27 +975,26 @@ def handle_telegram_commands():
             continue
 
         if text.startswith("/report"):
-            parts = text.split()
-            send_telegram("🟡 Building report…", chat_id=chat_id)
-            try:
-                if len(parts) == 1:
-                    reps = [analyze_symbol(s) for s in SYMBOLS]
-                    # FULL report for ALL — send per symbol (safe + readable)
-                    for r in reps:
-                        _send_long_text(chat_id, build_report_full(r))
-                        send_telegram("—" * 22, chat_id=chat_id)
-                    continue
-                else:
-                    sym = parts[1].upper()
-                    if sym not in SYMBOLS:
-                        send_telegram(f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}", chat_id=chat_id)
-                        continue
-                    r = analyze_symbol(sym)
-                    _send_long_text(chat_id, build_report_full(r))
-                    continue
-            except Exception as e:
-                send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
-            continue
+    parts = text.split()
+    send_telegram("🟡 Building report…", chat_id=chat_id)
+    try:
+        if len(parts) == 1:
+            reps = [analyze_symbol(s) for s in SYMBOLS]
+            msg = compress_report_all(reps)   # <-- ALWAYS ONE MESSAGE
+            send_telegram(msg, chat_id=chat_id)
+        else:
+            sym = parts[1].upper()
+            if sym not in SYMBOLS:
+                send_telegram(
+                    f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}",
+                    chat_id=chat_id
+                )
+                continue
+            r = analyze_symbol(sym)
+            send_telegram(build_report_full(r, include_signal_reasons=True), chat_id=chat_id)
+    except Exception as e:
+        send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
+    continue
 
 
 # ---------- MAIN SCAN (AUTO PUSH) ---------- #
@@ -995,3 +1058,4 @@ if __name__ == "__main__":
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 send_telegram(f"❌ Runtime error\n{e}")
         time.sleep(CMD_POLL_SECONDS)
+
