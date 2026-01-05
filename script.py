@@ -1,6 +1,6 @@
 """
 MOMENTUM PRO — MULTI-ALERT + DETAILED REPORT (Telegram Enabled, SAFE)
-v7.1 (FIXED) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
+v7.1.1 (FIXED+) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
 
 GOAL
 - Scanner only — NOT a trade signal.
@@ -52,7 +52,6 @@ QUIET_ATR_DIST_15M_ON = 1.20
 # (optional hysteresis - NOT used in this minimal patch)
 # QUIET_RSI_1H_OFF = 68.0
 # QUIET_ATR_DIST_15M_OFF = 1.00
-
 
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
@@ -118,7 +117,6 @@ _KLINE_CACHE = {}                 # (symbol, tf) -> np.array
 _DERIV_CACHE = {}                 # symbol -> (ts, dict)
 DERIV_TTL_SEC = 30
 
-
 # ================== RATE LIMIT HELPERS ================== #
 
 def _rate_guard():
@@ -144,7 +142,6 @@ def _should_backoff(resp, json_data):
 def _sleep_backoff(attempt):
     s = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt))
     time.sleep(s)
-
 
 # ================== NETWORK HELPERS ================== #
 
@@ -173,7 +170,6 @@ def http_get_json(url, params=None, timeout=10):
             if attempt == 4:
                 raise
             _sleep_backoff(attempt)
-
 
 # ================== TELEGRAM ================== #
 
@@ -258,7 +254,6 @@ def telegram_get_updates(offset=None, timeout=20):
     data = http_get_json(url, params=params, timeout=timeout + 5)
     return data.get("result", []) if isinstance(data, dict) else []
 
-
 # ================== INDICATORS ================== #
 
 def ema(series, length):
@@ -313,7 +308,6 @@ def atr_distance(price, ema20, atr):
     if atr is None or (isinstance(atr, float) and np.isnan(atr)) or atr <= 0:
         return 0.0
     return abs(price - ema20) / atr
-
 
 # ================== BINANCE DATA (INCREMENTAL) ================== #
 
@@ -370,7 +364,6 @@ def fetch_derivatives_cached(symbol):
     d = {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
     _DERIV_CACHE[symbol] = (now, d)
     return d
-
 
 # ================== SNAPSHOT ================== #
 
@@ -448,7 +441,6 @@ def compute_returns(tf_snaps):
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
 
-
 # ================== STRUCTURE / DELTA / INTENT ================== #
 
 def _structure_flags_15m(tf15, side):
@@ -491,7 +483,6 @@ def _intent_candle(tf15):
     if atr is None or (isinstance(atr, float) and np.isnan(atr)) or atr <= 0:
         return False
     return abs(float(body)) >= (BODY_ATR_MIN * float(atr))
-
 
 # ================== CONTEXT SCORING (old-style report) ================== #
 
@@ -608,7 +599,6 @@ def _trg_score(tf15, side, ret15):
     reasons.append(f"VOLx snapshot {volx:.2f}")
 
     return score, reasons, up, down
-
 
 # ================== SIGNAL LOGIC ================== #
 
@@ -753,14 +743,18 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
 
     return {"level": "CONFIRM", "side": side, "reasons": reasons}
 
-
 # ================== ANALYSIS ================== #
+
 def quiet_mode_blocks(signal, tf15, tf1h):
     """
     Option B: If market is extended, block SCOUT+CONFIRM (keep PULLBACK).
     Extension defined by:
       - RSI(1h) very high (LONG) or very low (SHORT)
       - ATR distance from EMA20 on 15m >= threshold
+
+    v7.1.1 addition:
+      - Escape hatch for CONFIRM if there is real structure (break or reclaim/reject).
+        This avoids missing "important continuation moments".
     """
     level = signal.get("level")
     if level not in ("SCOUT", "CONFIRM"):
@@ -769,6 +763,12 @@ def quiet_mode_blocks(signal, tf15, tf1h):
     side = signal.get("side")
     rsi1h = float(tf1h["rsi"])
     dist = atr_distance(float(tf15["price"]), float(tf15["ema20"]), float(tf15["atr"]))
+
+    # Escape hatch: don't block CONFIRM if structure is real
+    if level == "CONFIRM":
+        st = _structure_flags_15m(tf15, side)
+        if st.get("break") or st.get("reclaim"):
+            return False
 
     if side == "LONG":
         return (rsi1h >= QUIET_RSI_1H_LONG_ON) and (dist >= QUIET_ATR_DIST_15M_ON)
@@ -793,25 +793,30 @@ def analyze_symbol(symbol):
 
     # Both sides
     s_long = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "LONG", ret_15m)
-    if s_long: signals.append(s_long)
+    if s_long:
+        signals.append(s_long)
     s_short = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "SHORT", ret_15m)
-    if s_short: signals.append(s_short)
+    if s_short:
+        signals.append(s_short)
 
     pb_long = _pullback_signal(tf_snaps["15m"], symbol, "LONG")
-    if pb_long: signals.append(pb_long)
+    if pb_long:
+        signals.append(pb_long)
     pb_short = _pullback_signal(tf_snaps["15m"], symbol, "SHORT")
-    if pb_short: signals.append(pb_short)
+    if pb_short:
+        signals.append(pb_short)
 
     c_long = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "LONG", ret_15m)
-    if c_long: signals.append(c_long)
+    if c_long:
+        signals.append(c_long)
     c_short = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "SHORT", ret_15m)
-    if c_short: signals.append(c_short)
-      
-        # QUIET FILTER (Option B): reduce noise when extended
+    if c_short:
+        signals.append(c_short)
+
+    # QUIET FILTER (Option B): reduce noise when extended
     tf15 = tf_snaps["15m"]
     tf1h = tf_snaps["1h"]
     signals = [s for s in signals if not quiet_mode_blocks(s, tf15, tf1h)]
-
 
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
@@ -828,7 +833,6 @@ def analyze_symbol(symbol):
         "deriv": deriv,
         "oi_change_pct": oi_change_pct,
     }
-
 
 # ================== ANTI-SPAM / GATING ================== #
 
@@ -886,7 +890,6 @@ def mark_sent(symbol, signal, report):
 
     if level in ("SCOUT", "CONFIRM"):
         _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(price)}
-
 
 # ================== REPORT FORMATTING (OLD STYLE) ================== #
 
@@ -1044,7 +1047,6 @@ def build_report_all_text(reps):
             out += "\n\n——————————————————————\n\n"
     return out
 
-
 # ================== ALERT MESSAGE (AUTO PUSH) ================== #
 
 def build_signal_message(rep, signal):
@@ -1088,7 +1090,6 @@ def build_signal_message(rep, signal):
 
     return msg.strip()
 
-
 # ================== TELEGRAM COMMAND HANDLER ================== #
 
 def handle_telegram_commands():
@@ -1126,7 +1127,7 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v7.1 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
+                "v7.1.1 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
@@ -1152,7 +1153,6 @@ def handle_telegram_commands():
                 send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
             continue
 
-
 # ================== MAIN SCAN (AUTO PUSH) ================== #
 
 def run_once():
@@ -1170,7 +1170,6 @@ def run_once():
                     send_telegram(build_signal_message(rep, sig))
                 mark_sent(sym, sig, rep)
 
-
 # ================== RUNNER ================== #
 
 if __name__ == "__main__":
@@ -1179,12 +1178,13 @@ if __name__ == "__main__":
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
-            "✅ Momentum bot ONLINE (v7.1 FIXED)\n"
+            "✅ Momentum bot ONLINE (v7.1.1 FIXED+)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
             "- Levels: SCOUT (early), PULLBACK (entry), CONFIRM (continuation)\n"
             "- Both sides: LONG + SHORT\n"
             f"- VOLx: scout≥{VOLX_SCOUT}, pullback≥{VOLX_PULLBACK}, confirm≥{VOLX_CONFIRM}\n"
             f"- Confirm late filter: soft {SOFT_LATE_ATR_CONFIRM} ATR, hard {LATE_ATR_BLOCK_CONFIRM} ATR\n"
+            "- QUIET filter: blocks SCOUT/CONFIRM in extension, but lets CONFIRM through if STRUCT break/reclaim.\n"
             "Manual: /report or /report ETHUSDT\n\n"
             "If /report doesn't respond in a GROUP: use /report@YourBotName or disable privacy mode in BotFather."
         )
@@ -1210,4 +1210,3 @@ if __name__ == "__main__":
 
         # small sleep so we don't spin CPU if no updates arrive
         time.sleep(0.2)
-
