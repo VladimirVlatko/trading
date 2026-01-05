@@ -44,6 +44,16 @@ RETURN_LOOKBACK_1H = 6
 RETURN_LOOKBACK_4H = 6
 
 # --- alert thresholds (tuned) ---
+# --- QUIET FILTER (Option B: reduce noise in trend/extension) ---
+QUIET_RSI_1H_LONG_ON = 70.0
+QUIET_RSI_1H_SHORT_ON = 30.0
+QUIET_ATR_DIST_15M_ON = 1.20
+
+# (optional hysteresis - NOT used in this minimal patch)
+# QUIET_RSI_1H_OFF = 68.0
+# QUIET_ATR_DIST_15M_OFF = 1.00
+
+
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
 VOLX_CONFIRM = 1.10
@@ -745,6 +755,25 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
 
 
 # ================== ANALYSIS ================== #
+def quiet_mode_blocks(signal, tf15, tf1h):
+    """
+    Option B: If market is extended, block SCOUT+CONFIRM (keep PULLBACK).
+    Extension defined by:
+      - RSI(1h) very high (LONG) or very low (SHORT)
+      - ATR distance from EMA20 on 15m >= threshold
+    """
+    level = signal.get("level")
+    if level not in ("SCOUT", "CONFIRM"):
+        return False  # keep PULLBACK always
+
+    side = signal.get("side")
+    rsi1h = float(tf1h["rsi"])
+    dist = atr_distance(float(tf15["price"]), float(tf15["ema20"]), float(tf15["atr"]))
+
+    if side == "LONG":
+        return (rsi1h >= QUIET_RSI_1H_LONG_ON) and (dist >= QUIET_ATR_DIST_15M_ON)
+    else:
+        return (rsi1h <= QUIET_RSI_1H_SHORT_ON) and (dist >= QUIET_ATR_DIST_15M_ON)
 
 def analyze_symbol(symbol):
     tf_snaps = {}
@@ -777,6 +806,12 @@ def analyze_symbol(symbol):
     if c_long: signals.append(c_long)
     c_short = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "SHORT", ret_15m)
     if c_short: signals.append(c_short)
+      
+        # QUIET FILTER (Option B): reduce noise when extended
+    tf15 = tf_snaps["15m"]
+    tf1h = tf_snaps["1h"]
+    signals = [s for s in signals if not quiet_mode_blocks(s, tf15, tf1h)]
+
 
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
@@ -1175,3 +1210,4 @@ if __name__ == "__main__":
 
         # small sleep so we don't spin CPU if no updates arrive
         time.sleep(0.2)
+
