@@ -129,7 +129,7 @@ TP_R2 = 2.0
 
 # ---- auto-push levels ----
 # Default: only send ENTRY_OK to avoid noise and flip-flops.
-AUTO_PUSH_LEVELS = {"ENTRY_OK"}  # e.g. {"ENTRY_OK","CONFIRM"} if you want more
+AUTO_PUSH_LEVELS = {"CONFIRM", "ENTRY_OK"}  # e.g. {"ENTRY_OK","CONFIRM"} if you want more
 
 # ================== STATE ================== #
 
@@ -1593,4 +1593,5 @@ if __name__ == "__main__":
                     pass
 
         time.sleep(0.2)
+
 
