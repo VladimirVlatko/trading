@@ -174,7 +174,7 @@ def _sleep_backoff(attempt):
 # ================== NETWORK HELPERS ================== #
 
 def http_get_json(url, params=None, timeout=10):
-    for attempt in range(5):
+    for attempt in range(6):
         _rate_guard()
         try:
             r = requests.get(url, params=params, timeout=timeout)
@@ -182,6 +182,19 @@ def http_get_json(url, params=None, timeout=10):
                 data = r.json()
             except Exception:
                 data = None
+
+            # If JSON decode failed (often HTML/empty), retry with backoff
+            if data is None:
+                _sleep_backoff(attempt)
+                continue
+
+            # Binance can return {"code": ..., "msg": ...}
+            if isinstance(data, dict) and "code" in data and data.get("code") not in (0, None):
+                # treat as error; backoff only for rate-limit codes
+                if _should_backoff(r, data):
+                    _sleep_backoff(attempt)
+                    continue
+                raise Exception(f"Binance error {data.get('code')}: {data.get('msg')}")
 
             if r.status_code >= 400:
                 if _should_backoff(r, data):
@@ -194,10 +207,12 @@ def http_get_json(url, params=None, timeout=10):
                 continue
 
             return data
-        except Exception:
-            if attempt == 4:
+
+        except Exception as e:
+            if attempt == 5:
                 raise
             _sleep_backoff(attempt)
+
 
 # ================== TELEGRAM ================== #
 
@@ -339,7 +354,12 @@ def _fetch_klines_raw(symbol, interval, limit=200):
     url = f"{BINANCE_FUTURES}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     data = http_get_json(url, params=params, timeout=10)
+
+    if not isinstance(data, list) or len(data) == 0:
+        raise Exception(f"Klines invalid/empty for {symbol} {interval}: {str(data)[:200]}")
+
     return np.array(data, dtype=float)
+
 
 def get_klines_cached(symbol, tf):
     key = (symbol, tf)
@@ -375,6 +395,29 @@ def fetch_derivatives_cached(symbol):
     hit = _DERIV_CACHE.get(symbol)
     if hit and (now - hit[0] < DERIV_TTL_SEC):
         return hit[1]
+
+    mark = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
+    oi = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=10)
+
+    if not isinstance(mark, dict) or not isinstance(oi, dict):
+        raise Exception(f"Deriv invalid for {symbol}: mark={type(mark)} oi={type(oi)}")
+
+    # (optional extra safety)
+    for k in ("markPrice", "indexPrice", "lastFundingRate"):
+        if k not in mark:
+            raise Exception(f"premiumIndex missing {k} for {symbol}: {str(mark)[:200]}")
+    if "openInterest" not in oi:
+        raise Exception(f"openInterest missing openInterest for {symbol}: {str(oi)[:200]}")
+
+    mark_price = float(mark["markPrice"])
+    index_price = float(mark["indexPrice"])
+    funding_pct = float(mark["lastFundingRate"]) * 100.0
+    basis_pct = (mark_price - index_price) / (index_price + 1e-12) * 100.0
+    oi_val = float(oi["openInterest"])
+
+    d = {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
+    _DERIV_CACHE[symbol] = (now, d)
+    return d
 
     mark = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
     oi = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=10)
@@ -1550,3 +1593,4 @@ if __name__ == "__main__":
                     pass
 
         time.sleep(0.2)
+
