@@ -1,6 +1,7 @@
 """
 MOMENTUM PRO — MULTI-ALERT + DETAILED REPORT (Telegram Enabled, SAFE)
-v7.1.1 (FIXED+) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
+v7.2.0 (FIXED+5M) — SCOUT + PULLBACK + CONFIRM, LONG/SHORT
++ Adds 5m ENTRY_HINT annotation (OK / PULLBACK_ZONE / EXTENDED / DANGER) without blocking signals.
 
 GOAL
 - Scanner only — NOT a trade signal.
@@ -48,10 +49,6 @@ RETURN_LOOKBACK_4H = 6
 QUIET_RSI_1H_LONG_ON = 70.0
 QUIET_RSI_1H_SHORT_ON = 30.0
 QUIET_ATR_DIST_15M_ON = 1.20
-
-# (optional hysteresis - NOT used in this minimal patch)
-# QUIET_RSI_1H_OFF = 68.0
-# QUIET_ATR_DIST_15M_OFF = 1.00
 
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
@@ -103,6 +100,23 @@ KLINE_SEED_LIMIT = 220
 KLINE_MIN_BARS = 120
 KLINE_TAIL_FETCH = 2
 
+# ---- 5m ENTRY HINT (annotation only; NO blocking) ----
+ENTRY5M_ENABLED = True
+ENTRY5M_LIMIT = 160  # ~13h of 5m bars
+
+# thresholds (side-aware via rsi_eff)
+ENTRY5M_RSI_OK_MAX = 65.0
+ENTRY5M_RSI_EXTENDED_MIN = 70.0
+ENTRY5M_RSI_DANGER_MIN = 78.0
+
+ENTRY5M_DIST_OK_MAX_ATR = 1.10
+ENTRY5M_DIST_EXTENDED_MIN_ATR = 1.50
+ENTRY5M_DIST_DANGER_MIN_ATR = 2.00
+
+ENTRY5M_VOLX_OK_MAX = 1.40
+ENTRY5M_VOLX_EXTENDED_MIN = 2.00
+
+
 # ================== STATE ================== #
 
 _last_update_id = 0
@@ -116,6 +130,7 @@ _last_impulse = {}                # (symbol, side) -> {"ts":..., "level":..., "p
 _KLINE_CACHE = {}                 # (symbol, tf) -> np.array
 _DERIV_CACHE = {}                 # symbol -> (ts, dict)
 DERIV_TTL_SEC = 30
+
 
 # ================== RATE LIMIT HELPERS ================== #
 
@@ -142,6 +157,7 @@ def _should_backoff(resp, json_data):
 def _sleep_backoff(attempt):
     s = min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt))
     time.sleep(s)
+
 
 # ================== NETWORK HELPERS ================== #
 
@@ -170,6 +186,7 @@ def http_get_json(url, params=None, timeout=10):
             if attempt == 4:
                 raise
             _sleep_backoff(attempt)
+
 
 # ================== TELEGRAM ================== #
 
@@ -254,6 +271,7 @@ def telegram_get_updates(offset=None, timeout=20):
     data = http_get_json(url, params=params, timeout=timeout + 5)
     return data.get("result", []) if isinstance(data, dict) else []
 
+
 # ================== INDICATORS ================== #
 
 def ema(series, length):
@@ -309,6 +327,7 @@ def atr_distance(price, ema20, atr):
         return 0.0
     return abs(price - ema20) / atr
 
+
 # ================== BINANCE DATA (INCREMENTAL) ================== #
 
 def _fetch_klines_raw(symbol, interval, limit=200):
@@ -346,6 +365,19 @@ def get_klines_cached(symbol, tf):
     _KLINE_CACHE[key] = k
     return k
 
+def get_5m_snapshot(symbol: str):
+    """
+    5m is fetched on-demand and used ONLY as annotation (entry timing hint).
+    Not part of scanner logic; does not affect signals.
+    """
+    if not ENTRY5M_ENABLED:
+        return None
+    try:
+        k5 = _fetch_klines_raw(symbol, "5m", limit=ENTRY5M_LIMIT)
+        return tf_snapshot(k5, "5m")
+    except Exception:
+        return None
+
 def fetch_derivatives_cached(symbol):
     now = time.time()
     hit = _DERIV_CACHE.get(symbol)
@@ -364,6 +396,7 @@ def fetch_derivatives_cached(symbol):
     d = {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
     _DERIV_CACHE[symbol] = (now, d)
     return d
+
 
 # ================== SNAPSHOT ================== #
 
@@ -441,6 +474,45 @@ def compute_returns(tf_snaps):
         out[tf] = pct_change(close[-1], close[-1 - lb]) if len(close) > lb else 0.0
     return out
 
+
+# ================== 5m ENTRY HINT ================== #
+
+def entry_hint_5m(snap5, side: str):
+    """
+    Side-aware hint using rsi_eff:
+      rsi_eff = RSI if LONG else (100 - RSI) for SHORT
+    So higher rsi_eff = more "extended" in trade direction.
+    """
+    if snap5 is None:
+        return "N/A", "5m n/a"
+
+    p = float(snap5["price"])
+    e20 = float(snap5["ema20"])
+    atr = float(snap5["atr"]) if snap5["atr"] is not None else float("nan")
+    volx = float(snap5["vol_ratio"])
+    rsi = float(snap5["rsi"])
+
+    rsi_eff = rsi if side == "LONG" else (100.0 - rsi)
+    dist = atr_distance(p, e20, atr)
+
+    # Classify
+    danger = (rsi_eff >= ENTRY5M_RSI_DANGER_MIN) or (dist >= ENTRY5M_DIST_DANGER_MIN_ATR and volx >= ENTRY5M_VOLX_EXTENDED_MIN)
+    extended = (rsi_eff >= ENTRY5M_RSI_EXTENDED_MIN) or (dist >= ENTRY5M_DIST_EXTENDED_MIN_ATR) or (volx >= ENTRY5M_VOLX_EXTENDED_MIN)
+    ok = (rsi_eff <= ENTRY5M_RSI_OK_MAX) and (dist <= ENTRY5M_DIST_OK_MAX_ATR) and (volx <= ENTRY5M_VOLX_OK_MAX)
+
+    if danger:
+        hint = "DANGER"
+    elif ok:
+        hint = "OK"
+    elif extended:
+        hint = "EXTENDED"
+    else:
+        hint = "PULLBACK_ZONE"
+
+    details = f"5m rsiEff={rsi_eff:.1f} distATR={dist:.2f} volx={volx:.2f}"
+    return hint, details
+
+
 # ================== STRUCTURE / DELTA / INTENT ================== #
 
 def _structure_flags_15m(tf15, side):
@@ -483,6 +555,7 @@ def _intent_candle(tf15):
     if atr is None or (isinstance(atr, float) and np.isnan(atr)) or atr <= 0:
         return False
     return abs(float(body)) >= (BODY_ATR_MIN * float(atr))
+
 
 # ================== CONTEXT SCORING (old-style report) ================== #
 
@@ -599,6 +672,7 @@ def _trg_score(tf15, side, ret15):
     reasons.append(f"VOLx snapshot {volx:.2f}")
 
     return score, reasons, up, down
+
 
 # ================== SIGNAL LOGIC ================== #
 
@@ -743,6 +817,7 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
 
     return {"level": "CONFIRM", "side": side, "reasons": reasons}
 
+
 # ================== ANALYSIS ================== #
 
 def quiet_mode_blocks(signal, tf15, tf1h):
@@ -818,11 +893,34 @@ def analyze_symbol(symbol):
     tf1h = tf_snaps["1h"]
     signals = [s for s in signals if not quiet_mode_blocks(s, tf15, tf1h)]
 
+    # Build public tf dict
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
             if kk not in ("close_series", "high_series", "low_series", "delta_series", "vol_series")}
         for k, v in tf_snaps.items()
     }
+
+    # ---- 5m annotation (on-demand) ----
+    snap5 = None
+    hints5 = {}
+    tf5_public = None
+
+    # Fetch 5m only if enabled AND either:
+    # - signals exist (auto push), OR
+    # - manual report (always ok to show)
+    # We fetch always here to keep /report consistent.
+    if ENTRY5M_ENABLED:
+        snap5 = get_5m_snapshot(symbol)
+        if snap5 is not None:
+            tf5_public = {kk: vv for kk, vv in snap5.items()
+                          if kk not in ("close_series", "high_series", "low_series", "delta_series", "vol_series")}
+            # Precompute both sides
+            hL, dL = entry_hint_5m(snap5, "LONG")
+            hS, dS = entry_hint_5m(snap5, "SHORT")
+            hints5 = {
+                "LONG": {"hint": hL, "details": dL},
+                "SHORT": {"hint": hS, "details": dS},
+            }
 
     return {
         "symbol": symbol,
@@ -832,7 +930,10 @@ def analyze_symbol(symbol):
         "returns": returns,
         "deriv": deriv,
         "oi_change_pct": oi_change_pct,
+        "tf5m": tf5_public,
+        "entry_hint_5m": hints5,
     }
+
 
 # ================== ANTI-SPAM / GATING ================== #
 
@@ -890,6 +991,7 @@ def mark_sent(symbol, signal, report):
 
     if level in ("SCOUT", "CONFIRM"):
         _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(price)}
+
 
 # ================== REPORT FORMATTING (OLD STYLE) ================== #
 
@@ -1017,6 +1119,18 @@ def build_report_oldstyle(rep):
     msg += tf_line("1h", t1h) + "\n"
     msg += tf_line("15m", t15) + "\n"
 
+    # ---- 5m line + hint (optional, helpful for entry timing) ----
+    if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
+        t5 = rep["tf5m"]
+        h = rep["entry_hint_5m"].get(side_for_report, {})
+        msg += (
+            f"` 5m` [{tf_trend_label({'price': t5['price'], 'ema20': t5['ema20'], 'ema50': t5['ema50']})}] "
+            f"p `{fmt_num(t5['price'],2)}` | EMA20 `{fmt_num(t5['ema20'],2)}` "
+            f"EMA50 `{fmt_num(t5['ema50'],2)}` | RSI `{fmt_num(t5['rsi'],1)}` | "
+            f"ATR `{fmt_num(t5['atr'],2)}` | VOLx `{fmt_num(t5['vol_ratio'],2)}` "
+            f"| ENTRY_HINT `{h.get('hint','N/A')}`\n"
+        )
+
     msg += "Why flagged:\n"
     msg += f"• Context scored as: {_ctx_label(ctx1_up+ctx4_up, ctx1_dn+ctx4_dn)} (side={side_for_report})\n"
     msg += "• Setup (1h):\n"
@@ -1046,6 +1160,7 @@ def build_report_all_text(reps):
         if i != len(reps) - 1:
             out += "\n\n——————————————————————\n\n"
     return out
+
 
 # ================== ALERT MESSAGE (AUTO PUSH) ================== #
 
@@ -1078,6 +1193,16 @@ def build_signal_message(rep, signal):
             f"Δ {fmt_num(rep['tf']['15m']['vol_delta'],2)}\n"
         )
 
+    # ---- 5m annotation in alert (ENTRY_HINT) ----
+    if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
+        t5 = rep["tf5m"]
+        h = rep["entry_hint_5m"].get(side, {})
+        msg += (
+            f"5m: p {fmt_num(t5['price'],2)} | EMA20 {fmt_num(t5['ema20'],2)} | EMA50 {fmt_num(t5['ema50'],2)} | "
+            f"RSI {fmt_num(t5['rsi'],1)} | ATR {fmt_num(t5['atr'],2)} | VOLx {fmt_num(t5['vol_ratio'],2)}\n"
+            f"ENTRY_HINT(5m): {h.get('hint','N/A')} ({h.get('details','')})\n"
+        )
+
     msg += (
         f"Deriv: mark {fmt_num(deriv['mark'],2)} | funding {fmt_num(deriv['funding'],4)}% | "
         f"basis {fmt_num(deriv['basis'],4)}% | OI {fmt_num(deriv['oi'],0)}"
@@ -1089,6 +1214,7 @@ def build_signal_message(rep, signal):
         msg += f"- {line}\n"
 
     return msg.strip()
+
 
 # ================== TELEGRAM COMMAND HANDLER ================== #
 
@@ -1127,7 +1253,8 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v7.1.1 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
+                "v7.2.0 MULTI-ALERT: SCOUT + PULLBACK + CONFIRM, LONG/SHORT.\n"
+                "5m ENTRY_HINT added (annotation only).\n"
                 "Manual: /report or /report ETHUSDT",
                 chat_id=chat_id
             )
@@ -1139,7 +1266,6 @@ def handle_telegram_commands():
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
                     out = build_report_all_text(reps)
-                    # send_telegram will split automatically into multiple messages if needed
                     send_telegram(out, chat_id=chat_id)
                 else:
                     sym = parts[1].upper()
@@ -1152,6 +1278,7 @@ def handle_telegram_commands():
             except Exception as e:
                 send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
             continue
+
 
 # ================== MAIN SCAN (AUTO PUSH) ================== #
 
@@ -1170,6 +1297,7 @@ def run_once():
                     send_telegram(build_signal_message(rep, sig))
                 mark_sent(sym, sig, rep)
 
+
 # ================== RUNNER ================== #
 
 if __name__ == "__main__":
@@ -1178,13 +1306,14 @@ if __name__ == "__main__":
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
-            "✅ Momentum bot ONLINE (v7.1.1 FIXED+)\n"
+            "✅ Momentum bot ONLINE (v7.2.0 FIXED+5M)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
             "- Levels: SCOUT (early), PULLBACK (entry), CONFIRM (continuation)\n"
             "- Both sides: LONG + SHORT\n"
             f"- VOLx: scout≥{VOLX_SCOUT}, pullback≥{VOLX_PULLBACK}, confirm≥{VOLX_CONFIRM}\n"
             f"- Confirm late filter: soft {SOFT_LATE_ATR_CONFIRM} ATR, hard {LATE_ATR_BLOCK_CONFIRM} ATR\n"
             "- QUIET filter: blocks SCOUT/CONFIRM in extension, but lets CONFIRM through if STRUCT break/reclaim.\n"
+            "- 5m ENTRY_HINT: OK / PULLBACK_ZONE / EXTENDED / DANGER (annotation only; no blocking)\n"
             "Manual: /report or /report ETHUSDT\n\n"
             "If /report doesn't respond in a GROUP: use /report@YourBotName or disable privacy mode in BotFather."
         )
@@ -1192,7 +1321,6 @@ if __name__ == "__main__":
     last_scan = 0
     while True:
         try:
-            # long polling inside; stable for commands
             handle_telegram_commands()
 
             now = time.time()
@@ -1201,12 +1329,10 @@ if __name__ == "__main__":
                 last_scan = now
 
         except Exception as e:
-            # Do not crash; try to report
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 try:
                     send_telegram(f"❌ Runtime error\n{e}")
                 except Exception:
                     pass
 
-        # small sleep so we don't spin CPU if no updates arrive
         time.sleep(0.2)
