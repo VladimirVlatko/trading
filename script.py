@@ -1,22 +1,23 @@
 """
 MOMENTUM PRO — EXECUTION-AWARE MULTI-ALERT + DETAILED REPORT (Telegram Enabled, SAFE)
-v8.0.0 (CANDLE-CLOSE + ENTRY_OK + LEVERAGE_HINT + SL/TP)
-Built on your v7.2.0 base.
+v8.1.0 (FIXED ENTRY_OK + BETTER PULLBACK + 5m ENTRY GATING + SINGLE-MESSAGE /report)
 
-GOAL
-- Scanner only — NOT a trade signal.
-- Keep your old-style /report (ALL) multi-message (no truncation).
-- Fix flip-flop: evaluate on LAST CLOSED candle (not the live forming candle).
-- Add execution-aware layer:
-    - ENTRY_OK signal (state/confirmation on 5m close)
-    - Leverage suggestion (2x/3x/4x) based on score
-    - SL/TP suggestion (structure + ATR)
-- Keep SCOUT / PULLBACK / CONFIRM logic (optional to auto-push), but default auto-push = ENTRY_OK only.
+What changed vs your v8.0.0:
+1) FIX: ENTRY_OK logic was over-tight + had a pullback contradiction:
+   - Pullback zone no longer requires 15m price <= EMA20 (which kills entries in strong trends).
+   - Pullback zone is now ATR-distance based (near EMA20), trend-friendly.
+2) bias_ok relaxed (still strict enough for leverage, but not "only perfect trends"):
+   - 4h must be aligned (stack + slope)
+   - 1h must be supportive (above/below EMA20 + slope in same direction)
+3) ENTRY_OK anti-spam/gating uses LAST CLOSED 5m candle (not 15m) so it doesn't miss valid 5m entries.
+4) /report now sends ONE Telegram message by default (compact but still analysis-usable).
+   - /reportfull keeps your old multi-message (no truncation ever).
+5) Cleaned dead/unreachable code in fetch_derivatives_cached().
 
 NOTES
+- Scanner only — NOT a trade signal.
 - Binance Futures public endpoints only.
 - Telegram getUpdates long-polling (stable).
-- Works in private chat and groups.
 """
 
 import os
@@ -89,7 +90,7 @@ ONE_PER_CANDLE = True
 MIN_MOVE_SCOUT = {"BTCUSDT": 0.10, "ETHUSDT": 0.14, "SOLUSDT": 0.18}
 MIN_MOVE_PULLBACK = {"BTCUSDT": 0.15, "ETHUSDT": 0.20, "SOLUSDT": 0.25}
 MIN_MOVE_CONFIRM = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
-MIN_MOVE_ENTRY = {"BTCUSDT": 0.12, "ETHUSDT": 0.16, "SOLUSDT": 0.20}
+MIN_MOVE_ENTRY = {"BTCUSDT": 0.10, "ETHUSDT": 0.12, "SOLUSDT": 0.16}  # slightly easier
 
 # Telegram (strip to avoid hidden newline/space bugs)
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
@@ -128,8 +129,12 @@ TP_R1 = 1.0
 TP_R2 = 2.0
 
 # ---- auto-push levels ----
-# Default: only send ENTRY_OK to avoid noise and flip-flops.
-AUTO_PUSH_LEVELS = {"CONFIRM", "ENTRY_OK"}  # e.g. {"ENTRY_OK","CONFIRM"} if you want more
+# Default: ENTRY_OK only (as intended).
+AUTO_PUSH_LEVELS = {"ENTRY_OK"}  # add "CONFIRM" if you want: {"ENTRY_OK","CONFIRM"}
+
+# ---- report mode ----
+REPORT_SINGLE_MESSAGE = True  # /report -> one message compact
+TELEGRAM_MAX_LEN = 3900       # safe margin under Telegram 4096
 
 # ================== STATE ================== #
 
@@ -137,7 +142,7 @@ _last_update_id = 0
 _prev_oi = {}
 
 _last_sent = {}                   # (symbol, side, level) -> {"ts":..., "price":..., "candle_ot":...}
-_last_candle_by_key = {}          # (symbol, side, level) -> open_time (OF LAST CLOSED candle)
+_last_candle_by_key = {}          # (symbol, side, level) -> open_time (LAST CLOSED candle OT)
 _last_alert_price_by_key = {}     # (symbol, side, level) -> price
 _last_impulse = {}                # (symbol, side) -> {"ts":..., "level":..., "price":...}
 
@@ -183,14 +188,11 @@ def http_get_json(url, params=None, timeout=10):
             except Exception:
                 data = None
 
-            # If JSON decode failed (often HTML/empty), retry with backoff
             if data is None:
                 _sleep_backoff(attempt)
                 continue
 
-            # Binance can return {"code": ..., "msg": ...}
             if isinstance(data, dict) and "code" in data and data.get("code") not in (0, None):
-                # treat as error; backoff only for rate-limit codes
                 if _should_backoff(r, data):
                     _sleep_backoff(attempt)
                     continue
@@ -208,11 +210,10 @@ def http_get_json(url, params=None, timeout=10):
 
             return data
 
-        except Exception as e:
+        except Exception:
             if attempt == 5:
                 raise
             _sleep_backoff(attempt)
-
 
 # ================== TELEGRAM ================== #
 
@@ -221,10 +222,21 @@ def is_allowed_chat(chat_id: str) -> bool:
         return True
     return str(chat_id).strip() == str(TELEGRAM_CHAT_ID).strip()
 
+def _send_telegram_once(text: str, chat_id: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "disable_web_page_preview": True
+    }
+    resp = requests.post(url, json=payload, timeout=15)
+    if resp.status_code >= 400:
+        raise Exception(f"Telegram error {resp.status_code}: {resp.text[:600]}")
+
 def send_telegram(message: str, chat_id: str | None = None):
     """
-    Sends message. If longer than Telegram limit, automatically splits into chunks.
-    NO truncation ever.
+    Default sender: splits long messages (NO truncation).
+    Used for /reportfull and alerts.
     """
     if not TELEGRAM_TOKEN:
         return
@@ -234,7 +246,7 @@ def send_telegram(message: str, chat_id: str | None = None):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    MAX_LEN = 3900  # safe margin under Telegram 4096
+    MAX_LEN = TELEGRAM_MAX_LEN
 
     lines = message.split("\n")
     chunks = []
@@ -261,11 +273,7 @@ def send_telegram(message: str, chat_id: str | None = None):
 
     last_err = None
     for part in chunks:
-        payload = {
-            "chat_id": str(target),
-            "text": part,
-            "disable_web_page_preview": True
-        }
+        payload = {"chat_id": str(target), "text": part, "disable_web_page_preview": True}
         resp = requests.post(url, json=payload, timeout=15)
         if resp.status_code >= 400:
             last_err = f"Telegram error {resp.status_code}: {resp.text[:500]}"
@@ -273,6 +281,20 @@ def send_telegram(message: str, chat_id: str | None = None):
 
     if last_err:
         raise Exception(last_err)
+
+def send_telegram_single(message: str, chat_id: str | None = None):
+    """
+    Sends EXACTLY one Telegram message.
+    If too long, caller must compress first.
+    """
+    if not TELEGRAM_TOKEN:
+        return
+    target = (str(chat_id).strip() if chat_id is not None else TELEGRAM_CHAT_ID)
+    if not target or not message:
+        return
+    if len(message) > TELEGRAM_MAX_LEN:
+        raise Exception(f"Single-message report too long ({len(message)}>{TELEGRAM_MAX_LEN}).")
+    _send_telegram_once(message, target)
 
 def telegram_delete_webhook():
     if not TELEGRAM_TOKEN:
@@ -354,12 +376,9 @@ def _fetch_klines_raw(symbol, interval, limit=200):
     url = f"{BINANCE_FUTURES}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     data = http_get_json(url, params=params, timeout=10)
-
     if not isinstance(data, list) or len(data) == 0:
         raise Exception(f"Klines invalid/empty for {symbol} {interval}: {str(data)[:200]}")
-
     return np.array(data, dtype=float)
-
 
 def get_klines_cached(symbol, tf):
     key = (symbol, tf)
@@ -402,7 +421,6 @@ def fetch_derivatives_cached(symbol):
     if not isinstance(mark, dict) or not isinstance(oi, dict):
         raise Exception(f"Deriv invalid for {symbol}: mark={type(mark)} oi={type(oi)}")
 
-    # (optional extra safety)
     for k in ("markPrice", "indexPrice", "lastFundingRate"):
         if k not in mark:
             raise Exception(f"premiumIndex missing {k} for {symbol}: {str(mark)[:200]}")
@@ -419,32 +437,15 @@ def fetch_derivatives_cached(symbol):
     _DERIV_CACHE[symbol] = (now, d)
     return d
 
-    mark = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=10)
-    oi = http_get_json(f"{BINANCE_FUTURES}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=10)
-
-    mark_price = float(mark["markPrice"])
-    index_price = float(mark["indexPrice"])
-    funding_pct = float(mark["lastFundingRate"]) * 100.0
-    basis_pct = (mark_price - index_price) / (index_price + 1e-12) * 100.0
-    oi_val = float(oi["openInterest"])
-
-    d = {"mark": mark_price, "index": index_price, "funding": funding_pct, "basis": basis_pct, "oi": oi_val}
-    _DERIV_CACHE[symbol] = (now, d)
-    return d
-
 # ================== SNAPSHOT (LAST CLOSED CANDLE) ================== #
 
 def tf_snapshot_closed(k, tf_name):
     """
-    IMPORTANT:
-    - Binance returns current forming candle as the last row.
-    - To prevent flip-flop, we evaluate on the LAST CLOSED candle:
-        use series[:-1], and take last element from that.
+    Evaluate on LAST CLOSED candle (drop live forming candle).
     """
     if k is None or len(k) < 5:
         return None
 
-    # drop last (live) candle
     kc = k[:-1]
     if len(kc) < 5:
         return None
@@ -580,9 +581,6 @@ def rsi_eff(side: str, rsi_val: float) -> float:
     return rsi_val if side == "LONG" else (100.0 - rsi_val)
 
 def entry_hint_5m(snap5, side: str):
-    """
-    Same idea as your v7.2 hint, but snapshot is LAST CLOSED 5m candle.
-    """
     if snap5 is None:
         return "N/A", "5m n/a"
 
@@ -595,7 +593,6 @@ def entry_hint_5m(snap5, side: str):
     reff = rsi_eff(side, rsi)
     dist = atr_distance(p, e20, atr)
 
-    # Simple classification
     if reff >= 78 or (dist >= 2.0 and volx >= 2.0):
         hint = "DANGER"
     elif (reff <= 65) and (dist <= 1.10) and (volx <= 1.40):
@@ -609,11 +606,6 @@ def entry_hint_5m(snap5, side: str):
     return hint, details
 
 def entry_confirm_5m(snap5, side: str):
-    """
-    Execution-aware confirmation on 5m CLOSE:
-      LONG: close > EMA20 AND higher-high vs prev bar AND volx>=min AND rsiEff>=min
-      SHORT: close < EMA20 AND lower-low vs prev bar AND volx>=min AND rsiEff>=min
-    """
     if snap5 is None:
         return False, "5m n/a"
 
@@ -708,7 +700,7 @@ def _pick_best_side_for_report(rep):
 
     return "LONG" if totalL >= totalS else "SHORT"
 
-# ================== SCOUT / PULLBACK / CONFIRM (kept, but candle-close stable) ================== #
+# ================== SCOUT / PULLBACK / CONFIRM (kept) ================== #
 
 def _scout_signal(tf15, tf1h, side, ret15):
     reasons = []
@@ -854,7 +846,7 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
 def quiet_mode_blocks(signal, tf15, tf1h):
     level = signal.get("level")
     if level not in ("SCOUT", "CONFIRM"):
-        return False  # keep PULLBACK and ENTRY
+        return False
 
     side = signal.get("side")
     rsi1h = float(tf1h["rsi"])
@@ -873,29 +865,40 @@ def quiet_mode_blocks(signal, tf15, tf1h):
 # ================== EXECUTION-AWARE ENTRY_OK ================== #
 
 def bias_ok(rep, side: str) -> bool:
+    """
+    Relaxed but leverage-safe:
+    - 4h must be aligned (stack + slope)
+    - 1h must be supportive (price vs EMA20 + slope)
+    """
     tf1 = rep["tf_raw"]["1h"]
     tf4 = rep["tf_raw"]["4h"]
 
-    # stricter than scout: trend + stack + slopes
     if side == "LONG":
-        return (tf1["price"] > tf1["ema20"] > tf1["ema50"]) and (tf4["price"] > tf4["ema20"] > tf4["ema50"]) and (tf1["ema20_slp"] > 0) and (tf4["ema20_slp"] > 0)
+        htf_ok = (tf4["price"] > tf4["ema20"] > tf4["ema50"]) and (tf4["ema20_slp"] > 0)
+        ltf_ok = (tf1["price"] > tf1["ema20"]) and (tf1["ema20_slp"] > 0)
+        return htf_ok and ltf_ok
     else:
-        return (tf1["price"] < tf1["ema20"] < tf1["ema50"]) and (tf4["price"] < tf4["ema20"] < tf4["ema50"]) and (tf1["ema20_slp"] < 0) and (tf4["ema20_slp"] < 0)
+        htf_ok = (tf4["price"] < tf4["ema20"] < tf4["ema50"]) and (tf4["ema20_slp"] < 0)
+        ltf_ok = (tf1["price"] < tf1["ema20"]) and (tf1["ema20_slp"] < 0)
+        return htf_ok and ltf_ok
 
 def in_pullback_zone_15m(tf15, side: str) -> tuple[bool, float]:
+    """
+    FIX: old version required price <= EMA20 for LONG (kills entries in strong trends).
+    New: ATR-distance based "near EMA20" zone, trend-friendly.
+    """
     p = float(tf15["price"])
     e20 = float(tf15["ema20"])
     a = float(tf15["atr"])
     dist = atr_distance(p, e20, a)
-    if side == "LONG":
-        ok = (p <= e20) and (dist <= 1.60)
-    else:
-        ok = (p >= e20) and (dist <= 1.60)
+
+    # "Near EMA20" pullback zone (works both in trend and mild retraces)
+    ok = dist <= 0.85
     return ok, dist
 
 def entry_ok(rep, side: str, snap5):
     """
-    ENTRY_OK = Bias OK + (pullback zone OR continuation allowed with confirm) + 5m confirm + not late on 15m
+    ENTRY_OK = Bias OK + (pullback zone OR continuation-confirm) + 5m confirm + not late on 15m
     """
     tf15 = rep["tf_raw"]["15m"]
     dist15 = atr_distance(float(tf15["price"]), float(tf15["ema20"]), float(tf15["atr"]))
@@ -904,7 +907,6 @@ def entry_ok(rep, side: str, snap5):
 
     pb_ok, pb_dist = in_pullback_zone_15m(tf15, side)
 
-    # if not in pullback zone: allow continuation only when CONFIRM exists (strong context)
     cont_ok = False
     if ENTRY_ALLOW_CONTINUATION and not pb_ok:
         tf1 = rep["tf_raw"]["1h"]
@@ -914,13 +916,12 @@ def entry_ok(rep, side: str, snap5):
         cont_ok = c is not None
 
     if not pb_ok and not cont_ok:
-        return False, f"no pullback (dist={pb_dist:.2f}) and no continuation-confirm"
+        return False, f"no PB (dist={pb_dist:.2f}) and no continuation-confirm"
 
     ok5, reason5 = entry_confirm_5m(snap5, side)
     if not ok5:
         return False, f"5m confirm FAIL ({reason5})"
 
-    # extra preference: entry close to 5m EMA20
     if snap5 is not None:
         dist5 = atr_distance(float(snap5["price"]), float(snap5["ema20"]), float(snap5["atr"]))
         if dist5 > ENTRY5M_DIST_EMA20_MAX_ATR:
@@ -939,54 +940,45 @@ def leverage_score(rep, side: str, snap5):
     score = 0
     notes = []
 
-    # HTF alignment (0-3)
     if side == "LONG":
         if tf1["price"] > tf1["ema20"] > tf1["ema50"]: score += 1; notes.append("HTF1h")
         if tf4["price"] > tf4["ema20"] > tf4["ema50"]: score += 1; notes.append("HTF4h")
-        if tf1["rsi"] >= 58 and tf4["rsi"] >= 65: score += 1; notes.append("RSI_HTF")
+        if tf1["rsi"] >= 56 and tf4["rsi"] >= 62: score += 1; notes.append("RSI_HTF")
     else:
         if tf1["price"] < tf1["ema20"] < tf1["ema50"]: score += 1; notes.append("HTF1h")
         if tf4["price"] < tf4["ema20"] < tf4["ema50"]: score += 1; notes.append("HTF4h")
-        if tf1["rsi"] <= 42 and tf4["rsi"] <= 35: score += 1; notes.append("RSI_HTF")
+        if tf1["rsi"] <= 44 and tf4["rsi"] <= 38: score += 1; notes.append("RSI_HTF")
 
-    # not-late on 15m (0-1)
     dist15 = atr_distance(float(tf15["price"]), float(tf15["ema20"]), float(tf15["atr"]))
-    if dist15 <= 0.90:
+    if dist15 <= 0.95:
         score += 1; notes.append("notLate15m")
 
-    # structure (0-1)
     st = _structure_flags_15m(tf15, side)
     if st["break"] or st["reclaim"]:
         score += 1; notes.append("STRUCT15")
 
-    # participation (0-2)
     v15x = float(tf15["vol_ratio"])
-    if v15x >= 1.10:
+    if v15x >= 1.05:
         score += 1; notes.append("VOLx15")
     d_ok, _ = _delta_dominance(tf15)
     if d_ok:
         score += 1; notes.append("DELTA")
 
-    # 5m quality (0-2)
     if snap5 is not None:
         r5 = float(snap5["rsi"])
         reff = rsi_eff(side, r5)
         if reff >= 55: score += 1; notes.append("RSI5")
         v5x = float(snap5["vol_ratio"])
-        if v5x >= 1.10: score += 1; notes.append("VOLx5")
+        if v5x >= 1.05: score += 1; notes.append("VOLx5")
 
     score = int(clamp(score, 0, 10))
 
-    # map to leverage hint
     if score >= LEV_SCORE_4X_MIN:
-        lev = "4x"
-        label = "A+"
+        lev = "4x"; label = "A+"
     elif score >= LEV_SCORE_3X_MIN:
-        lev = "3x"
-        label = "A"
+        lev = "3x"; label = "A"
     else:
-        lev = "2x"
-        label = "B/C"
+        lev = "2x"; label = "B/C"
 
     return score, lev, f"{label} ({', '.join(notes) if notes else 'n/a'})"
 
@@ -998,9 +990,6 @@ def swing_low_high(series_high, series_low, lookback):
     return hi, lo
 
 def suggest_sl_tp(rep, side: str, entry_price: float, snap5):
-    """
-    Uses 5m swing + ATR buffer. If 5m not available, fallback to 15m.
-    """
     tf15 = rep["tf_raw"]["15m"]
 
     if snap5 is not None:
@@ -1053,7 +1042,6 @@ def analyze_symbol(symbol):
 
     signals = []
 
-    # base signals (both sides)
     s_long = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "LONG", ret_15m)
     if s_long: signals.append(s_long)
     s_short = _scout_signal(tf_snaps["15m"], tf_snaps["1h"], "SHORT", ret_15m)
@@ -1069,19 +1057,16 @@ def analyze_symbol(symbol):
     c_short = _confirm_signal(tf_snaps["15m"], tf_snaps["1h"], tf_snaps["4h"], "SHORT", ret_15m)
     if c_short: signals.append(c_short)
 
-    # quiet filter
     tf15 = tf_snaps["15m"]
     tf1h = tf_snaps["1h"]
     signals = [s for s in signals if not quiet_mode_blocks(s, tf15, tf1h)]
 
-    # public tf dict (for formatting)
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
             if kk not in ("close_series", "high_series", "low_series", "delta_series", "vol_series")}
         for k, v in tf_snaps.items()
     }
 
-    # 5m
     snap5 = get_tf5_closed(symbol) if TF5_ENABLED else None
     tf5_public = None
     hints5 = {}
@@ -1092,7 +1077,6 @@ def analyze_symbol(symbol):
         hS, dS = entry_hint_5m(snap5, "SHORT")
         hints5 = {"LONG": {"hint": hL, "details": dL}, "SHORT": {"hint": hS, "details": dS}}
 
-    # ENTRY_OK evaluation (both sides)
     entry_signals = []
     for side in ("LONG", "SHORT"):
         if not bias_ok({"tf_raw": tf_snaps}, side):
@@ -1154,21 +1138,30 @@ def _cooldown_for(level):
         return COOLDOWN_ENTRY
     return 10 * 60
 
+def _get_gate_reference(rep, level: str):
+    """
+    ENTRY_OK should gate on 5m (since it's a 5m close execution confirm).
+    Others gate on 15m.
+    """
+    if level == "ENTRY_OK":
+        s5 = rep.get("snap5_raw")
+        if s5 is not None:
+            return int(s5["open_time"]), float(s5["price"])
+    return int(rep["tf"]["15m"]["open_time"]), float(rep["tf"]["15m"]["price"])
+
 def allowed_to_send(symbol, signal, rep):
     side = signal["side"]
     level = signal["level"]
     key = (symbol, side, level)
     now = time.time()
 
-    # candle gating uses LAST CLOSED 15m candle open_time
-    candle_ot = rep["tf"]["15m"]["open_time"]
+    candle_ot, curr_price = _get_gate_reference(rep, level)
 
     if ONE_PER_CANDLE:
         last_candle = _last_candle_by_key.get(key)
         if last_candle is not None and candle_ot == last_candle:
             return False
 
-    curr_price = rep["tf"]["15m"]["price"]
     last_price = _last_alert_price_by_key.get(key)
     if last_price is not None and last_price > 0:
         move_pct = abs((curr_price - last_price) / last_price) * 100.0
@@ -1187,17 +1180,16 @@ def mark_sent(symbol, signal, rep):
     level = signal["level"]
     key = (symbol, side, level)
 
-    candle_ot = rep["tf"]["15m"]["open_time"]
-    price = rep["tf"]["15m"]["price"]
+    candle_ot, curr_price = _get_gate_reference(rep, level)
 
-    _last_sent[key] = {"ts": time.time(), "price": float(price), "candle_ot": int(candle_ot)}
+    _last_sent[key] = {"ts": time.time(), "price": float(curr_price), "candle_ot": int(candle_ot)}
     _last_candle_by_key[key] = candle_ot
-    _last_alert_price_by_key[key] = float(price)
+    _last_alert_price_by_key[key] = float(curr_price)
 
     if level in ("SCOUT", "CONFIRM"):
-        _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(price)}
+        _last_impulse[(symbol, side)] = {"ts": time.time(), "level": level, "price": float(curr_price)}
 
-# ================== REPORT FORMATTING (OLD STYLE + ENTRY SECTION) ================== #
+# ================== FORMATTING ================== #
 
 def fmt_num(x, digits=2):
     try:
@@ -1219,7 +1211,6 @@ def range_snapshot_from_klines(symbol, tf, candles: int):
     k = get_klines_cached(symbol, tf)
     if k is None or len(k) < candles + 2:
         return None, None
-    # use last closed candles range
     tail = k[-(candles+1):-1]
     lo = float(np.min(tail[:, 3]))
     hi = float(np.max(tail[:, 2]))
@@ -1260,12 +1251,10 @@ def _trg_score(tf15, side, ret15):
     st = _structure_flags_15m(tf15, side)
     if st["break"]:
         reasons.append("Structure (break)"); score += 1
-        if side == "LONG": up += 1
-        else: down += 1
+        (up := up + 1) if side == "LONG" else (down := down + 1)
     elif st["reclaim"]:
         reasons.append("Structure (reclaim/reject EMA20)"); score += 1
-        if side == "LONG": up += 1
-        else: down += 1
+        (up := up + 1) if side == "LONG" else (down := down + 1)
     else:
         reasons.append("No structure (no break/reclaim)")
 
@@ -1278,7 +1267,7 @@ def _trg_score(tf15, side, ret15):
             elif dn < 0: down += 1
 
     dist = atr_distance(p, e20, atr)
-    reasons.append(f"ATR dist: {dist:.2f} (target early zone 0.25–0.75/1.00)")
+    reasons.append(f"ATR dist: {dist:.2f}")
     score += 1
 
     if side == "LONG" and ret15 > 0:
@@ -1290,6 +1279,8 @@ def _trg_score(tf15, side, ret15):
 
     reasons.append(f"VOLx snapshot {volx:.2f}")
     return score, reasons, up, down
+
+# ---- OLD STYLE (unchanged, still available for /reportfull) ----
 
 def build_report_oldstyle(rep):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -1361,7 +1352,6 @@ def build_report_oldstyle(rep):
     msg += tf_line("1h", t1h) + "\n"
     msg += tf_line("15m", t15) + "\n"
 
-    # 5m line + hint
     if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
         t5 = rep["tf5m"]
         h = rep["entry_hint_5m"].get(side_for_report, {})
@@ -1373,7 +1363,6 @@ def build_report_oldstyle(rep):
             f"| ENTRY_HINT `{h.get('hint','N/A')}`\n"
         )
 
-    # ENTRY section
     if rep.get("entry_signals"):
         msg += "\nENTRY_OK:\n"
         for es in rep["entry_signals"][:2]:
@@ -1416,6 +1405,116 @@ def build_report_all_text(reps):
             out += "\n\n——————————————————————\n\n"
     return out
 
+# ---- COMPACT (single-message) REPORT ----
+
+def _report_compact_one(rep):
+    sym = rep["symbol"]
+    t15 = rep["tf"]["15m"]
+    t1 = rep["tf"]["1h"]
+    t4 = rep["tf"]["4h"]
+    deriv = rep["deriv"]
+    oi_chg = rep["oi_change_pct"]
+
+    side_for_report = _pick_best_side_for_report(rep)
+    ret15 = rep["returns"]["15m"]
+
+    ctx1, _, ctx1_up, ctx1_dn = _ctx_score(rep["tf_raw"]["1h"], side_for_report)
+    ctx4, _, ctx4_up, ctx4_dn = _ctx_score(rep["tf_raw"]["4h"], side_for_report)
+    trg, trg_reasons, trg_up, trg_dn = _trg_score(rep["tf_raw"]["15m"], side_for_report, ret15)
+
+    total = ctx1 + ctx4 + trg
+    alert = _alert_level_from_total(total)
+    dir15 = tf_trend_label({"price": t15["price"], "ema20": t15["ema20"], "ema50": t15["ema50"]})
+
+    up_tr = ctx1_up + ctx4_up + trg_up
+    dn_tr = ctx1_dn + ctx4_dn + trg_dn
+
+    buy = t15.get("vol_buy")
+    sell = t15.get("vol_sell")
+    delt = t15.get("vol_delta")
+
+    lines = []
+    lines.append(f"*{sym}* | *{alert}* | DIR15 {dir15} | total `{total}` (UP `{up_tr}`/DOWN `{dn_tr}`)")
+
+    lines.append(
+        f"p `{fmt_num(t15['price'],2)}` | EMA20/50 `{fmt_num(t15['ema20'],2)}`/`{fmt_num(t15['ema50'],2)}` | "
+        f"RSI 15/1h/4h `{fmt_num(t15['rsi'],1)}`/`{fmt_num(t1['rsi'],1)}`/`{fmt_num(t4['rsi'],1)}` | "
+        f"ATR15 `{fmt_num(t15['atr'],2)}` VOLx15 `{fmt_num(t15['vol_ratio'],2)}` ret15 `{fmt_num(ret15,2)}%`"
+    )
+
+    d = (
+        f"fund `{fmt_num(deriv['funding'],4)}%` basis `{fmt_num(deriv['basis'],4)}%` "
+        f"OI `{fmt_num(deriv['oi'],0)}`"
+    )
+    if oi_chg is not None:
+        d += f" OIΔ `{fmt_num(oi_chg,2)}%`"
+    lines.append("Deriv: " + d)
+
+    if buy is not None:
+        lines.append(f"Δ15m: buy `{fmt_num(buy,0)}` sell `{fmt_num(sell,0)}` Δ `{fmt_num(delt,0)}`")
+
+    # 5m hint (for chosen side)
+    if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
+        t5 = rep["tf5m"]
+        h = rep["entry_hint_5m"].get(side_for_report, {})
+        lines.append(
+            f"5m: p `{fmt_num(t5['price'],2)}` EMA20 `{fmt_num(t5['ema20'],2)}` RSI `{fmt_num(t5['rsi'],1)}` "
+            f"VOLx `{fmt_num(t5['vol_ratio'],2)}` | HINT `{h.get('hint','N/A')}`"
+        )
+
+    # ENTRY_OK top 1
+    if rep.get("entry_signals"):
+        es = rep["entry_signals"][0]
+        lines.append(
+            f"ENTRY_OK: *{es['side']}* entry `{fmt_num(es['entry_price'],2)}` "
+            f"LEV `{es['lev_hint']}` (score {es['lev_score']}/10) | "
+            f"SL `{fmt_num(es['sl'],2)}` TP1 `{fmt_num(es['tp1'],2)}` TP2 `{fmt_num(es['tp2'],2)}`"
+        )
+    else:
+        lines.append("ENTRY_OK: none")
+
+    # keep only top 3 trigger reasons (enough for analysis)
+    lines.append("Why: " + "; ".join(trg_reasons[:3]))
+
+    return "\n".join(lines)
+
+def build_report_all_compact(reps):
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    out = [f"📊 *MANUAL REPORT (ALL — COMPACT)*\nUTC: `{ts}`\n_(Scanner only — NOT a signal. Uses LAST CLOSED candles.)_\n"]
+    for i, rep in enumerate(reps):
+        out.append(_report_compact_one(rep))
+        if i != len(reps) - 1:
+            out.append("\n——————————\n")
+    text = "\n".join(out).strip()
+
+    # Hard-fit to single message by trimming least important extras if needed
+    if len(text) <= TELEGRAM_MAX_LEN:
+        return text
+
+    # If too long: remove "Why" lines first, then 5m lines, then delta
+    lines = text.splitlines()
+    def drop_if_contains(substr):
+        return [ln for ln in lines if substr not in ln]
+
+    for step in range(3):
+        if len("\n".join(lines)) <= TELEGRAM_MAX_LEN:
+            break
+        if step == 0:
+            lines = [ln for ln in lines if not ln.startswith("Why:")]
+        elif step == 1:
+            lines = [ln for ln in lines if not ln.startswith("5m:")]
+        else:
+            lines = [ln for ln in lines if not ln.startswith("Δ15m:")]
+
+    final = "\n".join(lines).strip()
+    if len(final) > TELEGRAM_MAX_LEN:
+        # last resort: keep headers + per-symbol first two lines only
+        compact2 = []
+        for ln in final.splitlines():
+            compact2.append(ln)
+        final = "\n".join(compact2)[:TELEGRAM_MAX_LEN-40] + "\n…use /reportfull for full detail"
+    return final
+
 # ================== ALERT MESSAGE (AUTO PUSH) ================== #
 
 def build_signal_message(rep, signal):
@@ -1447,7 +1546,6 @@ def build_signal_message(rep, signal):
             f"Δ {fmt_num(rep['tf']['15m']['vol_delta'],2)}\n"
         )
 
-    # 5m annotation
     if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
         t5 = rep["tf5m"]
         h = rep["entry_hint_5m"].get(side, {})
@@ -1465,7 +1563,6 @@ def build_signal_message(rep, signal):
         msg += f" | OIΔ {fmt_num(oi_chg,2)}%"
     msg += "\n\n"
 
-    # ENTRY extras
     if level == "ENTRY_OK":
         msg += f"ENTRY: {fmt_num(signal.get('entry_price'),2)}\n"
         msg += f"LEVERAGE_HINT: {signal.get('lev_hint')} (Score {signal.get('lev_score')}/10) — {signal.get('lev_meta')}\n"
@@ -1507,20 +1604,21 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v8.0.0 EXECUTION-AWARE: candle-close eval + ENTRY_OK + leverage + SL/TP.\n"
+                "v8.1.0: fixed ENTRY_OK (trend-friendly pullback) + 5m gating + /report single message.\n"
                 f"Auto-push levels: {', '.join(sorted(AUTO_PUSH_LEVELS))}\n"
-                "Manual: /report or /report ETHUSDT",
+                "Manual: /report, /report ETHUSDT, /reportfull, /reportfull ETHUSDT",
                 chat_id=chat_id
             )
             continue
 
-        if text.startswith("/report"):
+        # --- /report (single compact message by default) ---
+        if text.startswith("/reportfull"):
             parts = text.split()
             try:
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
                     out = build_report_all_text(reps)
-                    send_telegram(out, chat_id=chat_id)
+                    send_telegram(out, chat_id=chat_id)  # multi-message, no truncation
                 else:
                     sym = parts[1].upper()
                     if sym not in SYMBOLS:
@@ -1529,6 +1627,33 @@ def handle_telegram_commands():
                     r = analyze_symbol(sym)
                     out = build_report_oldstyle(r)
                     send_telegram(out, chat_id=chat_id)
+            except Exception as e:
+                send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
+            continue
+
+        if text.startswith("/report"):
+            parts = text.split()
+            try:
+                if len(parts) == 1:
+                    reps = [analyze_symbol(s) for s in SYMBOLS]
+                    if REPORT_SINGLE_MESSAGE:
+                        out = build_report_all_compact(reps)
+                        send_telegram_single(out, chat_id=chat_id)
+                    else:
+                        out = build_report_all_text(reps)
+                        send_telegram(out, chat_id=chat_id)
+                else:
+                    sym = parts[1].upper()
+                    if sym not in SYMBOLS:
+                        send_telegram(f"❗Unknown symbol: {sym}\nAllowed: {', '.join(SYMBOLS)}", chat_id=chat_id)
+                        continue
+                    r = analyze_symbol(sym)
+                    if REPORT_SINGLE_MESSAGE:
+                        out = "📊 *MANUAL REPORT (COMPACT)*\n\n" + _report_compact_one(r)
+                        send_telegram_single(out[:TELEGRAM_MAX_LEN], chat_id=chat_id)
+                    else:
+                        out = build_report_oldstyle(r)
+                        send_telegram(out, chat_id=chat_id)
             except Exception as e:
                 send_telegram(f"❌ Manual report error:\n{e}", chat_id=chat_id)
             continue
@@ -1544,7 +1669,6 @@ def run_once():
                 send_telegram(f"⚠️ Symbol error {sym}\n{e}")
             continue
 
-        # Build a combined list of signals to consider for auto push
         combined = []
         combined.extend(rep.get("signals", []))
         combined.extend(rep.get("entry_signals", []))
@@ -1565,13 +1689,13 @@ if __name__ == "__main__":
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
-            "✅ Momentum bot ONLINE (v8.0.0 candle-close + ENTRY_OK)\n"
+            "✅ Momentum bot ONLINE (v8.1.0)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
             "- Candles: evaluates LAST CLOSED (fixes flip-flop)\n"
             f"- Auto-push: {', '.join(sorted(AUTO_PUSH_LEVELS))}\n"
-            "- Base levels still computed: SCOUT / PULLBACK / CONFIRM (optional)\n"
-            "- ENTRY_OK: adds leverage hint + SL/TP suggestions\n"
-            "Manual: /report or /report ETHUSDT\n\n"
+            "- ENTRY_OK: fixed pullback zone + 5m gating + leverage + SL/TP\n"
+            "- /report: single-message compact\n"
+            "- /reportfull: original multi-message (no truncation)\n\n"
             "If /report doesn't respond in a GROUP: use /report@YourBotName or disable privacy mode in BotFather."
         )
 
@@ -1593,5 +1717,3 @@ if __name__ == "__main__":
                     pass
 
         time.sleep(0.2)
-
-
