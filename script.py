@@ -1,6 +1,6 @@
 import os
 import time
-import math
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -8,49 +8,58 @@ import requests
 import pandas as pd
 import pandas_ta as ta
 
-# =========================
+
+# ============================================================
 # ENV (required)
-# =========================
+# ============================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in env vars.")
+    raise RuntimeError("Missing env vars: TELEGRAM_TOKEN and/or TELEGRAM_CHAT_ID")
 
-# =========================
+
+# ============================================================
 # CONFIG
-# =========================
+# ============================================================
 BINANCE_FAPI = "https://fapi.binance.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-TF_15M = "15m"
-TF_1H = "1h"
-TF_4H = "4h"
+# Scan cadence
+SLEEP_TARGET_SECONDS = 60
 
-SLEEP_TARGET_SECONDS = 60   # scan cadence
+# HTTP timeouts
 HTTP_TIMEOUT = 12
-TELEGRAM_TIMEOUT = 55       # long poll seconds
+TELEGRAM_POLL_TIMEOUT = 55  # long poll
 
-# Trigger params
+# Candle limits
 OHLCV_LIMIT_15M = 220
 OHLCV_LIMIT_HTF = 260
+
+# Trigger parameters
 VOL_SPIKE_MULT = 1.5
 RSI_MIN, RSI_MAX = 25, 75
 
-# Anti-spam controls (IMPORTANT now that it's real-time)
-EDGE_TRIGGER_ONLY = True      # send only on FALSE->TRUE transition
-COOLDOWN_SECONDS = 10 * 60    # if conditions stay TRUE, allow resend after 10 min (set 0 to disable)
+# MACD slope threshold (ATR scaled): require macdh slope magnitude >= ATR * this factor
+MACD_SLOPE_ATR_FACTOR = 0.03  # 0.03 * ATR (tune 0.02–0.06)
 
-# Telegram max 4096 chars
+# Telegram chunking
 TG_CHUNK = 3500
 
+# Error reporting rate-limit
+ERROR_NOTIFY_COOLDOWN = 120  # seconds
+
+# Startup message
+SEND_STARTUP_MESSAGE = True
+
+
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "momentum-scanner/telegram/rt/1.0"})
+SESSION.headers.update({"User-Agent": "momentum-entrywatch/1.0"})
 
 
-# =========================
-# Time helpers
-# =========================
+# ============================================================
+# Helpers: time / formatting
+# ============================================================
 def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -76,14 +85,17 @@ def last_closed_open_ms(tf: str) -> int:
 
 def safe_float(x, default=None):
     try:
-        return float(x)
+        v = float(x)
+        if pd.isna(v):
+            return default
+        return v
     except Exception:
         return default
 
 
-# =========================
-# Binance public REST
-# =========================
+# ============================================================
+# Binance Futures public REST
+# ============================================================
 def http_get(path: str, params: dict) -> dict | list:
     url = BINANCE_FAPI + path
     r = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
@@ -97,8 +109,8 @@ def fetch_klines_df(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         "ts", "open", "high", "low", "close", "volume",
         "close_ts", "qav", "trades", "taker_buy_base", "taker_buy_quote", "ignore"
     ])
-    df = df[["ts", "open", "high", "low", "close", "volume"]].copy()
-    for c in ["open", "high", "low", "close", "volume"]:
+    df = df[["ts", "open", "high", "low", "close", "volume", "taker_buy_base"]].copy()
+    for c in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("int64")
     return df
@@ -109,18 +121,18 @@ def fetch_mark_price(symbol: str) -> float | None:
     return safe_float(j.get("markPrice"))
 
 
-# =========================
+# ============================================================
 # Telegram (polling)
-# =========================
+# ============================================================
 def tg_api(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
 
 def tg_get_updates(offset: int | None) -> dict:
-    params = {"timeout": TELEGRAM_TIMEOUT}
+    params = {"timeout": TELEGRAM_POLL_TIMEOUT}
     if offset is not None:
         params["offset"] = offset
-    r = SESSION.get(tg_api("getUpdates"), params=params, timeout=TELEGRAM_TIMEOUT + 10)
+    r = SESSION.get(tg_api("getUpdates"), params=params, timeout=TELEGRAM_POLL_TIMEOUT + 10)
     r.raise_for_status()
     return r.json()
 
@@ -133,13 +145,13 @@ def tg_send_message(text: str):
         r.raise_for_status()
 
 
-# =========================
+# ============================================================
 # Indicators
-# =========================
+# ============================================================
 def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # ✅ VWAP in pandas_ta needs an ORDERED DatetimeIndex
+    # VWAP in pandas_ta requires ordered DatetimeIndex
     out["dt"] = pd.to_datetime(out["ts"], unit="ms", utc=True)
     out = out.sort_values("dt").set_index("dt")
 
@@ -147,9 +159,7 @@ def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
     out["ema50"] = ta.ema(out["close"], length=50)
     out["ema200"] = ta.ema(out["close"], length=200)
 
-    # VWAP (now valid)
     out["vwap"] = ta.vwap(out["high"], out["low"], out["close"], out["volume"])
-
     out["rsi14"] = ta.rsi(out["close"], length=14)
 
     macd = ta.macd(out["close"], fast=12, slow=26, signal=9)
@@ -165,10 +175,12 @@ def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
     out["atr14"] = ta.atr(out["high"], out["low"], out["close"], length=14)
     out["vol_sma20"] = out["volume"].rolling(20).mean()
 
-    # return to normal index
+    # Useful "delta proxy": taker buy vs sell (base volume)
+    out["taker_buy"] = out["taker_buy_base"]
+    out["taker_sell"] = out["volume"] - out["taker_buy"]
+
     out = out.reset_index(drop=True)
     return out
-
 
 
 def add_ema_pack(df: pd.DataFrame) -> pd.DataFrame:
@@ -179,17 +191,9 @@ def add_ema_pack(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def macdh_slope(df15: pd.DataFrame, i: int) -> float:
-    a = safe_float(df15.loc[i, "macdh"])
-    b = safe_float(df15.loc[i - 1, "macdh"])
-    if a is None or b is None or (math.isnan(a) or math.isnan(b)):
-        return float("nan")
-    return a - b
-
-
-# =========================
-# Cache to reduce HTF requests
-# =========================
+# ============================================================
+# Cache (HTF refresh only when new candle closes)
+# ============================================================
 @dataclass
 class TFCached:
     df: pd.DataFrame | None = None
@@ -198,12 +202,12 @@ class TFCached:
 
 class MarketCache:
     def __init__(self):
-        self.data = {s: {TF_15M: TFCached(), TF_1H: TFCached(), TF_4H: TFCached()} for s in SYMBOLS}
+        self.data = {s: {"15m": TFCached(), "1h": TFCached(), "4h": TFCached()} for s in SYMBOLS}
 
     def refresh_15m(self, symbol: str):
-        df = fetch_klines_df(symbol, TF_15M, OHLCV_LIMIT_15M)
+        df = fetch_klines_df(symbol, "15m", OHLCV_LIMIT_15M)
         df = add_indicators_15m(df)
-        self.data[symbol][TF_15M] = TFCached(df=df, last_closed_open_ms=last_closed_open_ms(TF_15M))
+        self.data[symbol]["15m"] = TFCached(df=df, last_closed_open_ms=last_closed_open_ms("15m"))
 
     def refresh_htf_if_needed(self, symbol: str, tf: str):
         expected = last_closed_open_ms(tf)
@@ -214,8 +218,8 @@ class MarketCache:
             self.data[symbol][tf] = TFCached(df=df, last_closed_open_ms=expected)
 
     def ensure_context_ready(self, symbol: str):
-        self.refresh_htf_if_needed(symbol, TF_1H)
-        self.refresh_htf_if_needed(symbol, TF_4H)
+        self.refresh_htf_if_needed(symbol, "1h")
+        self.refresh_htf_if_needed(symbol, "4h")
 
     def get(self, symbol: str, tf: str) -> pd.DataFrame:
         df = self.data[symbol][tf].df
@@ -224,89 +228,134 @@ class MarketCache:
         return df
 
 
-# =========================
-# REAL-TIME condition check (NOT candle-close)
-# =========================
-def conditions_met_realtime(symbol: str, df15: pd.DataFrame) -> dict | None:
+# ============================================================
+# Entry trigger (15m LAST CLOSED, cross-based, HTF-filtered)
+# ============================================================
+def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> dict | None:
     """
-    Uses the MOST RECENT candle row (can be forming candle).
-    Condition = "momentum is ON right now":
-      - Price vs VWAP: price above vwap (LONG) or below vwap (SHORT)
-      - EMA20 vs EMA50: ema20 > ema50 (LONG) or ema20 < ema50 (SHORT)
-      - Volume spike: current candle volume >= 1.5x SMA20(volume)
-      - RSI filter: 25 < RSI < 75
+    High-probability entry-watch trigger (scanner only):
+      - Uses LAST CLOSED 15m candle: i = -2 (stable)
+      - Cross-based:
+          * close crosses VWAP
+          * EMA20 crosses EMA50
+      - Volume spike >= VOL_SPIKE_MULT * SMA20(volume)
+      - RSI in [25,75] (room)
+      - MACD histogram slope threshold (ATR scaled)
+      - HTF filter:
+          LONG only if 1h & 4h above EMA200
+          SHORT only if 1h & 4h below EMA200
     """
-    i = len(df15) - 1  # latest row (may be forming)
-    if i < 205:
+    i = len(df15) - 2
+    p = i - 1
+    if i < 210:
         return None
 
-    # Guard for NaNs
-    needed = ["close", "vwap", "ema20", "ema50", "rsi14", "volume", "vol_sma20", "atr14", "macdh"]
-    if any(pd.isna(df15.loc[i, c]) for c in needed):
+    needed = ["close", "vwap", "ema20", "ema50", "rsi14", "volume", "vol_sma20", "macdh", "atr14"]
+    if not all(c in df15.columns for c in needed):
         return None
 
-    close = float(df15.loc[i, "close"])
-    vwap = float(df15.loc[i, "vwap"])
-    ema20 = float(df15.loc[i, "ema20"])
-    ema50 = float(df15.loc[i, "ema50"])
-    rsi = float(df15.loc[i, "rsi14"])
-    vol = float(df15.loc[i, "volume"])
+    # NaN guards (both current and previous where needed)
+    for c in needed:
+        if pd.isna(df15.loc[i, c]):
+            return None
+    for c in ["close", "vwap", "ema20", "ema50", "macdh"]:
+        if pd.isna(df15.loc[p, c]):
+            return None
+
+    # HTF: last closed candles
+    i1h = len(df1h) - 2
+    i4h = len(df4h) - 2
+    if i1h < 205 or i4h < 205:
+        return None
+    if any(pd.isna(df1h.loc[i1h, x]) for x in ["close", "ema200"]) or any(pd.isna(df4h.loc[i4h, x]) for x in ["close", "ema200"]):
+        return None
+
+    c1h, e1h = float(df1h.loc[i1h, "close"]), float(df1h.loc[i1h, "ema200"])
+    c4h, e4h = float(df4h.loc[i4h, "close"]), float(df4h.loc[i4h, "ema200"])
+    htf_long_ok = (c1h > e1h) and (c4h > e4h)
+    htf_short_ok = (c1h < e1h) and (c4h < e4h)
+
+    # 15m values
+    c_prev, c_curr = float(df15.loc[p, "close"]), float(df15.loc[i, "close"])
+    v_prev, v_curr = float(df15.loc[p, "vwap"]), float(df15.loc[i, "vwap"])
+    e20_prev, e20_curr = float(df15.loc[p, "ema20"]), float(df15.loc[i, "ema20"])
+    e50_prev, e50_curr = float(df15.loc[p, "ema50"]), float(df15.loc[i, "ema50"])
+
+    vol_curr = float(df15.loc[i, "volume"])
     vol_avg = float(df15.loc[i, "vol_sma20"])
-
     if vol_avg <= 0:
         return None
-
-    vol_ratio = vol / vol_avg
+    vol_ratio = vol_curr / vol_avg
     if vol_ratio < VOL_SPIKE_MULT:
         return None
 
+    rsi = float(df15.loc[i, "rsi14"])
     if not (RSI_MIN < rsi < RSI_MAX):
         return None
 
-    # Determine direction by state (not cross)
-    long_ok = (close > vwap) and (ema20 > ema50)
-    short_ok = (close < vwap) and (ema20 < ema50)
+    # Cross logic
+    vwap_cross_up = (c_prev <= v_prev) and (c_curr > v_curr)
+    vwap_cross_dn = (c_prev >= v_prev) and (c_curr < v_curr)
+    ema_cross_up = (e20_prev <= e50_prev) and (e20_curr > e50_curr)
+    ema_cross_dn = (e20_prev >= e50_prev) and (e20_curr < e50_curr)
 
-    if not (long_ok or short_ok):
-        return None
+    # MACD hist slope threshold (ATR scaled)
+    mh_curr = float(df15.loc[i, "macdh"])
+    mh_prev = float(df15.loc[p, "macdh"])
+    mh_slope = mh_curr - mh_prev
 
-    direction = "LONG" if long_ok else "SHORT"
-    candle_ts = int(df15.loc[i, "ts"])  # open time of the current 15m candle
-    return {"symbol": symbol, "direction": direction, "vol_ratio": float(vol_ratio), "i": i, "candle_ts": candle_ts}
+    atr = float(df15.loc[i, "atr14"])
+    slope_thr = max(1e-12, atr * MACD_SLOPE_ATR_FACTOR)
+
+    # Dedupe anchor: the closed candle open time
+    candle_ts = int(df15.loc[i, "ts"])
+
+    if vwap_cross_up and ema_cross_up and (mh_slope > slope_thr) and htf_long_ok:
+        return {"symbol": symbol, "direction": "LONG", "vol_ratio": vol_ratio, "i": i, "candle_ts": candle_ts}
+
+    if vwap_cross_dn and ema_cross_dn and (mh_slope < -slope_thr) and htf_short_ok:
+        return {"symbol": symbol, "direction": "SHORT", "vol_ratio": vol_ratio, "i": i, "candle_ts": candle_ts}
+
+    return None
 
 
-def build_snapshot_report(symbol: str, direction: str, vol_ratio: float,
+# ============================================================
+# Report building
+# ============================================================
+def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: float,
                           df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, i15: int) -> str:
-    # HTF indexes: use last closed (more stable)
-    i1h = len(df1h) - 2
-    i4h = len(df4h) - 2
-
-    # Use markPrice for "current price" in report
     mark = fetch_mark_price(symbol)
     px = mark if mark is not None else float(df15.loc[i15, "close"])
 
-    # HTF context vs EMA200
-    c1h = float(df1h.loc[i1h, "close"])
-    e200_1h = float(df1h.loc[i1h, "ema200"])
-    c4h = float(df4h.loc[i4h, "close"])
-    e200_4h = float(df4h.loc[i4h, "ema200"])
+    # HTF last closed
+    i1h = len(df1h) - 2
+    i4h = len(df4h) - 2
+    c1h, e1h = float(df1h.loc[i1h, "close"]), float(df1h.loc[i1h, "ema200"])
+    c4h, e4h = float(df4h.loc[i4h, "close"]), float(df4h.loc[i4h, "ema200"])
+    ctx_1h = "ABOVE" if c1h > e1h else "BELOW"
+    ctx_4h = "ABOVE" if c4h > e4h else "BELOW"
 
-    ctx_1h = "ABOVE" if c1h > e200_1h else "BELOW"
-    ctx_4h = "ABOVE" if c4h > e200_4h else "BELOW"
-
-    # 15m metrics (realtime candle possible)
-    rsi = float(df15.loc[i15, "rsi14"])
-    macdh = safe_float(df15.loc[i15, "macdh"], default=float("nan"))
-    slope = macdh_slope(df15, i15) if i15 >= 1 else float("nan")
-    slope_dir = "INCREASING" if slope > 0 else "DECREASING" if slope < 0 else "FLAT/NA"
-    atr = float(df15.loc[i15, "atr14"])
-
+    # 15m metrics (use i15 as provided; for manual report we use -2 too)
     vwap = float(df15.loc[i15, "vwap"])
     ema20 = float(df15.loc[i15, "ema20"])
     ema50 = float(df15.loc[i15, "ema50"])
     ema200 = float(df15.loc[i15, "ema200"])
+    rsi = float(df15.loc[i15, "rsi14"])
+    macdh = float(df15.loc[i15, "macdh"])
+    atr = float(df15.loc[i15, "atr14"])
 
-    # Raw OHLC: last 3 candles including current (may be forming)
+    # MACD hist slope
+    prev = i15 - 1
+    mh_prev = safe_float(df15.loc[prev, "macdh"], default=float("nan")) if prev >= 0 else float("nan")
+    mh_slope = macdh - mh_prev if mh_prev == mh_prev else float("nan")
+    slope_dir = "INCREASING" if mh_slope == mh_slope and mh_slope > 0 else "DECREASING" if mh_slope == mh_slope and mh_slope < 0 else "FLAT/NA"
+
+    # Delta proxy (taker buy/sell)
+    tb = safe_float(df15.loc[i15, "taker_buy"], default=float("nan"))
+    ts = safe_float(df15.loc[i15, "taker_sell"], default=float("nan"))
+    delta = tb - ts if (tb == tb and ts == ts) else float("nan")
+
+    # OHLC last 3 (ending at i15)
     start = max(0, i15 - 2)
     rows = []
     for j in range(start, i15 + 1):
@@ -320,26 +369,29 @@ def build_snapshot_report(symbol: str, direction: str, vol_ratio: float,
         )
 
     msg = []
-    msg.append("🧠 SNAPSHOT REPORT (Realtime condition met — Scanner only, NOT a trade signal)")
+    msg.append(f"🧠 SNAPSHOT REPORT ({tag} — Scanner only, NOT a trade signal)")
     msg.append(f"UTC: {utc_now_str()}")
     msg.append("")
-    msg.append(f"{symbol} | MOMENTUM_OK | DIR(15m): {direction}")
+    msg.append(f"{symbol} | {tag} | DIR(15m): {direction}")
     msg.append(f"Price (mark): {px:.6f}")
     msg.append("")
     msg.append("Higher Timeframe Context (vs EMA200):")
-    msg.append(f"- 1h: close {c1h:.6f} is {ctx_1h} EMA200 {e200_1h:.6f}")
-    msg.append(f"- 4h: close {c4h:.6f} is {ctx_4h} EMA200 {e200_4h:.6f}")
+    msg.append(f"- 1h: close {c1h:.6f} is {ctx_1h} EMA200 {e1h:.6f}")
+    msg.append(f"- 4h: close {c4h:.6f} is {ctx_4h} EMA200 {e4h:.6f}")
     msg.append("")
-    msg.append("15m Trend + Momentum (latest candle may be forming):")
+    msg.append("15m Trend + Momentum (last closed candle):")
     msg.append(f"- VWAP {vwap:.6f} | EMA20 {ema20:.6f} | EMA50 {ema50:.6f} | EMA200 {ema200:.6f}")
     msg.append(f"- RSI(14): {rsi:.2f} (filter {RSI_MIN}–{RSI_MAX})")
-    msg.append(f"- MACD Hist: {macdh:.6f} | Hist slope: {slope:.6f} ({slope_dir})")
+    msg.append(f"- MACD Hist: {macdh:.6f} | Hist slope: {mh_slope:.6f} ({slope_dir})")
     msg.append("")
     msg.append("Volatility (15m):")
     msg.append(f"- ATR(14): {atr:.6f}")
     msg.append("")
     msg.append("Volume Strength (15m):")
-    msg.append(f"- Vol ratio (current/SMA20): {vol_ratio:.2f}x (need >= {VOL_SPIKE_MULT}x)")
+    msg.append(f"- Vol ratio (current/SMA20): {vol_ratio:.2f}x (need >= {VOL_SPIKE_MULT}x for trigger)")
+    msg.append("")
+    msg.append("Delta proxy (15m taker buy - taker sell):")
+    msg.append(f"- TakerBuy {tb:.2f} | TakerSell {ts:.2f} | Delta {delta:.2f}")
     msg.append("")
     msg.append("Raw Data Snippet — last 3 candles (OHLCV):")
     msg.extend(rows)
@@ -351,69 +403,74 @@ def build_manual_report(symbol: str, cache: MarketCache) -> str:
     cache.refresh_15m(symbol)
     cache.ensure_context_ready(symbol)
 
-    df15 = cache.get(symbol, TF_15M)
-    df1h = cache.get(symbol, TF_1H)
-    df4h = cache.get(symbol, TF_4H)
+    df15 = cache.get(symbol, "15m")
+    df1h = cache.get(symbol, "1h")
+    df4h = cache.get(symbol, "4h")
 
-    i15 = len(df15) - 1  # realtime row
-    vol = float(df15.loc[i15, "volume"]) if not pd.isna(df15.loc[i15, "volume"]) else float("nan")
-    vol_avg = float(df15.loc[i15, "vol_sma20"]) if not pd.isna(df15.loc[i15, "vol_sma20"]) else float("nan")
-    vol_ratio = (vol / vol_avg) if vol_avg and vol_avg > 0 else float("nan")
+    i15 = len(df15) - 2  # last closed candle (stable)
+    if i15 < 30:
+        return f"❌ Not enough data yet for {symbol}"
 
-    # Direction here is just state snapshot
-    direction = "N/A"
-    if not pd.isna(df15.loc[i15, "vwap"]) and not pd.isna(df15.loc[i15, "ema20"]) and not pd.isna(df15.loc[i15, "ema50"]):
-        close = float(df15.loc[i15, "close"])
-        vwap = float(df15.loc[i15, "vwap"])
-        ema20 = float(df15.loc[i15, "ema20"])
-        ema50 = float(df15.loc[i15, "ema50"])
+    vol = safe_float(df15.loc[i15, "volume"], default=float("nan"))
+    vol_avg = safe_float(df15.loc[i15, "vol_sma20"], default=float("nan"))
+    vol_ratio = (vol / vol_avg) if (vol_avg == vol_avg and vol_avg > 0) else float("nan")
+
+    # Bias label (state only) for manual
+    direction = "NEUTRAL"
+    close = safe_float(df15.loc[i15, "close"])
+    vwap = safe_float(df15.loc[i15, "vwap"])
+    ema20 = safe_float(df15.loc[i15, "ema20"])
+    ema50 = safe_float(df15.loc[i15, "ema50"])
+    if close is not None and vwap is not None and ema20 is not None and ema50 is not None:
         if close > vwap and ema20 > ema50:
             direction = "LONG-ish"
         elif close < vwap and ema20 < ema50:
             direction = "SHORT-ish"
 
-    return build_snapshot_report(symbol, direction, vol_ratio, df15, df1h, df4h, i15)
+    return build_snapshot_report(symbol, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15)
 
 
-# =========================
-# Telegram command parsing
-# =========================
-def parse_report_command(text: str) -> list[str] | None:
+# ============================================================
+# Command parsing
+# ============================================================
+def parse_command(text: str):
     if not text:
-        return None
+        return None, None
     parts = text.strip().split()
-    if not parts:
-        return None
-    if parts[0].lower() != "/report":
-        return None
-    if len(parts) == 1:
-        return SYMBOLS[:]
-    sym = parts[1].upper().replace("/", "")
-    if sym in SYMBOLS:
-        return [sym]
-    return ["__INVALID__"]
+    cmd = parts[0].lower()
+    arg = parts[1].upper().replace("/", "") if len(parts) > 1 else None
+    return cmd, arg
 
 
-# =========================
-# Main
-# =========================
+# ============================================================
+# Main loop
+# ============================================================
 def main():
-    tg_send_message(
-    "🤖 Momentum Scanner ONLINE\n"
-    f"UTC: {utc_now_str()}\n"
-    "Mode: Realtime momentum (forming candle)\n"
-    "Scan: ~60s\n"
-)
+    start_ts = time.time()
     cache = MarketCache()
 
-    # State per symbol for anti-spam
-    state = {
-        s: {
-            "was_true": False,
-            "last_sent_ts": 0.0,
-            "last_sent_dir": None,
-        } for s in SYMBOLS
+    # Per-symbol dedupe: last signaled candle_ts + direction
+    last_signal = {s: {"candle_ts": None, "direction": None} for s in SYMBOLS}
+
+    # Status/health
+    health = {
+        "last_scan_utc": None,
+        "last_signal_utc": None,
+        "last_signal_text": None,
+        "scan_count": 0,
     }
+
+    last_error_notify = 0.0
+
+    if SEND_STARTUP_MESSAGE:
+        tg_send_message(
+            "✅ BOT ONLINE\n"
+            f"UTC: {utc_now_str()}\n"
+            f"Mode: 15m close-based ENTRY_WATCH\n"
+            f"Scan: ~{SLEEP_TARGET_SECONDS}s\n"
+            f"Symbols: {', '.join(SYMBOLS)}\n"
+            "Commands: /report  |  /report BTCUSDT  |  /status"
+        )
 
     offset = None
 
@@ -421,7 +478,7 @@ def main():
         loop_start = time.time()
 
         try:
-            # 1) Telegram updates
+            # 1) Telegram polling
             upd = tg_get_updates(offset)
             if upd.get("ok") and upd.get("result"):
                 for u in upd["result"]:
@@ -430,70 +487,97 @@ def main():
                     chat = msg.get("chat") or {}
                     chat_id = str(chat.get("id", ""))
 
+                    # Only respond in configured chat
                     if chat_id != str(TELEGRAM_CHAT_ID):
                         continue
 
                     text = (msg.get("text") or "").strip()
-                    targets = parse_report_command(text)
-                    if targets is not None:
-                        if targets == ["__INVALID__"]:
-                            tg_send_message("❌ Usage: /report  OR  /report BTCUSDT|ETHUSDT|SOLUSDT")
-                        else:
-                            for s in targets:
-                                tg_send_message(build_manual_report(s, cache))
+                    cmd, arg = parse_command(text)
 
-            # 2) Scan realtime conditions (every loop)
+                    if cmd == "/report":
+                        if arg is None:
+                            for s in SYMBOLS:
+                                tg_send_message(build_manual_report(s, cache))
+                        else:
+                            sym = arg
+                            if sym not in SYMBOLS:
+                                tg_send_message("❌ Usage: /report OR /report BTCUSDT|ETHUSDT|SOLUSDT")
+                            else:
+                                tg_send_message(build_manual_report(sym, cache))
+
+                    elif cmd == "/status":
+                        uptime_min = int((time.time() - start_ts) / 60)
+                        last_scan = health["last_scan_utc"] or "N/A"
+                        last_sig = health["last_signal_utc"] or "N/A"
+                        last_sig_text = health["last_signal_text"] or "None yet"
+
+                        tg_send_message(
+                            "📡 STATUS\n"
+                            f"UTC now: {utc_now_str()}\n"
+                            f"Uptime: {uptime_min} min\n"
+                            f"Scan interval: ~{SLEEP_TARGET_SECONDS}s\n"
+                            f"Scans: {health['scan_count']}\n"
+                            f"Last scan: {last_scan}\n"
+                            f"Last signal: {last_sig}\n"
+                            f"Last signal detail: {last_sig_text}"
+                        )
+
+            # 2) Scan for entry triggers
             for symbol in SYMBOLS:
                 cache.refresh_15m(symbol)
-                cache.ensure_context_ready(symbol)  # 1h/4h only refresh when new candle
+                cache.ensure_context_ready(symbol)
 
-                df15 = cache.get(symbol, TF_15M)
-                df1h = cache.get(symbol, TF_1H)
-                df4h = cache.get(symbol, TF_4H)
+                df15 = cache.get(symbol, "15m")
+                df1h = cache.get(symbol, "1h")
+                df4h = cache.get(symbol, "4h")
 
-                cond = conditions_met_realtime(symbol, df15)
-                now = time.time()
-
-                if cond is None:
-                    state[symbol]["was_true"] = False
+                trig = check_entry_trigger(symbol, df15, df1h, df4h)
+                if trig is None:
                     continue
 
-                direction = cond["direction"]
-                i15 = cond["i"]
+                # Dedupe: avoid sending same candle trigger multiple times
+                if last_signal[symbol]["candle_ts"] == trig["candle_ts"] and last_signal[symbol]["direction"] == trig["direction"]:
+                    continue
 
-                # Edge-trigger: only send when it flips FALSE -> TRUE
-                should_send = True
-                if EDGE_TRIGGER_ONLY and state[symbol]["was_true"]:
-                    should_send = False
+                i15 = trig["i"]
+                report = build_snapshot_report(
+                    symbol=symbol,
+                    tag="ENTRY_WATCH (15m close trigger)",
+                    direction=trig["direction"],
+                    vol_ratio=trig["vol_ratio"],
+                    df15=df15,
+                    df1h=df1h,
+                    df4h=df4h,
+                    i15=i15
+                )
+                tg_send_message(report)
 
-                # Cooldown override: if conditions stay TRUE, allow resend after cooldown
-                if not should_send and COOLDOWN_SECONDS > 0:
-                    if (now - state[symbol]["last_sent_ts"]) >= COOLDOWN_SECONDS:
-                        should_send = True
+                last_signal[symbol]["candle_ts"] = trig["candle_ts"]
+                last_signal[symbol]["direction"] = trig["direction"]
 
-                if should_send:
-                    rep = build_snapshot_report(
-                        symbol=symbol,
-                        direction=direction,
-                        vol_ratio=cond["vol_ratio"],
-                        df15=df15,
-                        df1h=df1h,
-                        df4h=df4h,
-                        i15=i15,
-                    )
-                    tg_send_message(rep)
-                    state[symbol]["last_sent_ts"] = now
-                    state[symbol]["last_sent_dir"] = direction
+                health["last_signal_utc"] = utc_now_str()
+                health["last_signal_text"] = f"{symbol} {trig['direction']} @ candle {utc_ts(trig['candle_ts'])}"
 
-                state[symbol]["was_true"] = True
+            health["last_scan_utc"] = utc_now_str()
+            health["scan_count"] += 1
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            time.sleep(5)
-        except Exception:
-            # keep it alive; avoid spamming telegram with errors
-            time.sleep(5)
+            # network wobble: silent retry
+            pass
 
-        # 3) Maintain ~60s cadence
+        except Exception:
+            # Report errors to telegram (rate-limited)
+            now = time.time()
+            if (now - last_error_notify) >= ERROR_NOTIFY_COOLDOWN:
+                err = traceback.format_exc()
+                tg_send_message(
+                    "⚠️ BOT ERROR (rate-limited)\n"
+                    f"UTC: {utc_now_str()}\n\n"
+                    f"{err[:3500]}"
+                )
+                last_error_notify = now
+
+        # 3) Keep ~fixed cadence
         elapsed = time.time() - loop_start
         time.sleep(max(1, int(SLEEP_TARGET_SECONDS - elapsed)))
 
