@@ -52,6 +52,13 @@ ERROR_NOTIFY_COOLDOWN = 120  # seconds
 # Startup message
 SEND_STARTUP_MESSAGE = True
 
+# Heartbeat (to prove the bot is alive even if Telegram polling is blocked by 409)
+HEARTBEAT_MINUTES = 720  # set 0 to disable
+HEARTBEAT_TEXT = "🫀 HEARTBEAT (bot alive)"
+
+# When Telegram getUpdates returns 409 (another poller exists), wait this many seconds before retrying
+TG_CONFLICT_BACKOFF = 30
+
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "momentum-entrywatch/1.0"})
@@ -129,10 +136,22 @@ def tg_api(method: str) -> str:
 
 
 def tg_get_updates(offset: int | None) -> dict:
+    """
+    IMPORTANT:
+    - Telegram allows only one getUpdates long-poller at a time per bot token.
+    - If another poller exists, Telegram returns HTTP 409.
+    We handle 409 gracefully so the bot continues scanning & sending alerts.
+    """
     params = {"timeout": TELEGRAM_POLL_TIMEOUT}
     if offset is not None:
         params["offset"] = offset
+
     r = SESSION.get(tg_api("getUpdates"), params=params, timeout=TELEGRAM_POLL_TIMEOUT + 10)
+
+    # ✅ Handle 409 conflict gracefully (no exception, no spam)
+    if r.status_code == 409:
+        return {"ok": False, "conflict": True, "result": []}
+
     r.raise_for_status()
     return r.json()
 
@@ -232,19 +251,6 @@ class MarketCache:
 # Entry trigger (15m LAST CLOSED, cross-based, HTF-filtered)
 # ============================================================
 def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> dict | None:
-    """
-    High-probability entry-watch trigger (scanner only):
-      - Uses LAST CLOSED 15m candle: i = -2 (stable)
-      - Cross-based:
-          * close crosses VWAP
-          * EMA20 crosses EMA50
-      - Volume spike >= VOL_SPIKE_MULT * SMA20(volume)
-      - RSI in [25,75] (room)
-      - MACD histogram slope threshold (ATR scaled)
-      - HTF filter:
-          LONG only if 1h & 4h above EMA200
-          SHORT only if 1h & 4h below EMA200
-    """
     i = len(df15) - 2
     p = i - 1
     if i < 210:
@@ -307,7 +313,6 @@ def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4
     atr = float(df15.loc[i, "atr14"])
     slope_thr = max(1e-12, atr * MACD_SLOPE_ATR_FACTOR)
 
-    # Dedupe anchor: the closed candle open time
     candle_ts = int(df15.loc[i, "ts"])
 
     if vwap_cross_up and ema_cross_up and (mh_slope > slope_thr) and htf_long_ok:
@@ -335,7 +340,7 @@ def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: floa
     ctx_1h = "ABOVE" if c1h > e1h else "BELOW"
     ctx_4h = "ABOVE" if c4h > e4h else "BELOW"
 
-    # 15m metrics (use i15 as provided; for manual report we use -2 too)
+    # 15m metrics
     vwap = float(df15.loc[i15, "vwap"])
     ema20 = float(df15.loc[i15, "ema20"])
     ema50 = float(df15.loc[i15, "ema50"])
@@ -399,7 +404,7 @@ def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: floa
     return "\n".join(msg)
 
 
-def build_manual_report(symbol: str, cache: MarketCache) -> str:
+def build_manual_report(symbol: str, cache: "MarketCache") -> str:
     cache.refresh_15m(symbol)
     cache.ensure_context_ready(symbol)
 
@@ -407,7 +412,7 @@ def build_manual_report(symbol: str, cache: MarketCache) -> str:
     df1h = cache.get(symbol, "1h")
     df4h = cache.get(symbol, "4h")
 
-    i15 = len(df15) - 2  # last closed candle (stable)
+    i15 = len(df15) - 2
     if i15 < 30:
         return f"❌ Not enough data yet for {symbol}"
 
@@ -415,7 +420,6 @@ def build_manual_report(symbol: str, cache: MarketCache) -> str:
     vol_avg = safe_float(df15.loc[i15, "vol_sma20"], default=float("nan"))
     vol_ratio = (vol / vol_avg) if (vol_avg == vol_avg and vol_avg > 0) else float("nan")
 
-    # Bias label (state only) for manual
     direction = "NEUTRAL"
     close = safe_float(df15.loc[i15, "close"])
     vwap = safe_float(df15.loc[i15, "vwap"])
@@ -449,10 +453,8 @@ def main():
     start_ts = time.time()
     cache = MarketCache()
 
-    # Per-symbol dedupe: last signaled candle_ts + direction
     last_signal = {s: {"candle_ts": None, "direction": None} for s in SYMBOLS}
 
-    # Status/health
     health = {
         "last_scan_utc": None,
         "last_signal_utc": None,
@@ -461,6 +463,7 @@ def main():
     }
 
     last_error_notify = 0.0
+    last_heartbeat = 0.0
 
     if SEND_STARTUP_MESSAGE:
         tg_send_message(
@@ -478,16 +481,20 @@ def main():
         loop_start = time.time()
 
         try:
-            # 1) Telegram polling
+            # 1) Telegram polling (commands)
             upd = tg_get_updates(offset)
-            if upd.get("ok") and upd.get("result"):
+
+            # ✅ If conflict, don't error-spam; just backoff and keep scanning
+            if isinstance(upd, dict) and upd.get("conflict"):
+                time.sleep(TG_CONFLICT_BACKOFF)
+
+            if isinstance(upd, dict) and upd.get("ok") and upd.get("result"):
                 for u in upd["result"]:
                     offset = u["update_id"] + 1
                     msg = u.get("message") or {}
                     chat = msg.get("chat") or {}
                     chat_id = str(chat.get("id", ""))
 
-                    # Only respond in configured chat
                     if chat_id != str(TELEGRAM_CHAT_ID):
                         continue
 
@@ -499,10 +506,9 @@ def main():
                             reports = []
                             for s in SYMBOLS:
                                 reports.append(build_manual_report(s, cache))
-                                
+
                             combined = "\n\n" + ("=" * 32) + "\n\n"
                             tg_send_message(combined.join(reports))
-
                         else:
                             sym = arg
                             if sym not in SYMBOLS:
@@ -540,7 +546,6 @@ def main():
                 if trig is None:
                     continue
 
-                # Dedupe: avoid sending same candle trigger multiple times
                 if last_signal[symbol]["candle_ts"] == trig["candle_ts"] and last_signal[symbol]["direction"] == trig["direction"]:
                     continue
 
@@ -566,6 +571,19 @@ def main():
             health["last_scan_utc"] = utc_now_str()
             health["scan_count"] += 1
 
+            # 3) Heartbeat
+            if HEARTBEAT_MINUTES and HEARTBEAT_MINUTES > 0:
+                now = time.time()
+                if now - last_heartbeat >= HEARTBEAT_MINUTES * 60:
+                    tg_send_message(
+                        f"{HEARTBEAT_TEXT}\n"
+                        f"UTC: {utc_now_str()}\n"
+                        f"Scans: {health['scan_count']}\n"
+                        f"Last scan: {health['last_scan_utc'] or 'N/A'}\n"
+                        f"Last signal: {health['last_signal_text'] or 'None yet'}"
+                    )
+                    last_heartbeat = now
+
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             # network wobble: silent retry
             pass
@@ -582,7 +600,7 @@ def main():
                 )
                 last_error_notify = now
 
-        # 3) Keep ~fixed cadence
+        # 4) Keep ~fixed cadence
         elapsed = time.time() - loop_start
         time.sleep(max(1, int(SLEEP_TARGET_SECONDS - elapsed)))
 
