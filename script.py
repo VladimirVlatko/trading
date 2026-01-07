@@ -41,7 +41,7 @@ RSI_MIN, RSI_MAX = 25, 75
 MACD_SLOPE_ATR_FACTOR = 0.03  # 0.03 * ATR (tune 0.02–0.06)
 
 # Telegram chunking
-TG_CHUNK = 3500
+TG_CHUNK = 4096
 
 # Error reporting rate-limit
 ERROR_NOTIFY_COOLDOWN = 120  # seconds
@@ -146,11 +146,19 @@ def tg_get_updates(offset: int | None) -> dict:
     return r.json()
 
 def tg_send_message(text: str):
-    chunks = [text[i:i + TG_CHUNK] for i in range(0, len(text), TG_CHUNK)]
-    for ch in chunks:
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": ch}
-        r = SESSION.post(tg_api("sendMessage"), json=payload, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
+    """
+    Send a SINGLE Telegram message (no chunking).
+    If text exceeds Telegram limits, it is compacted/truncated safely.
+    """
+    if text is None:
+        return
+    text = str(text)
+    if len(text) > TG_CHUNK:
+        # Hard safety: keep one message; preserve the most important top part.
+        text = text[: TG_CHUNK - 40] + "\n…(truncated to fit Telegram)"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    r = SESSION.post(tg_api("sendMessage"), json=payload, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
 
 # ============================================================
 # Indicators
@@ -387,13 +395,40 @@ def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.Dat
     }
 
 # ============================================================
-# Report building
+# Report building (compact: single Telegram message friendly)
 # ============================================================
+def _fmt_px(x: float) -> str:
+    """Pretty price formatting based on magnitude."""
+    if x is None or not (x == x):
+        return "nan"
+    ax = abs(x)
+    if ax >= 10000:
+        return f"{x:.1f}"
+    if ax >= 1000:
+        return f"{x:.2f}"
+    if ax >= 100:
+        return f"{x:.3f}"
+    return f"{x:.4f}"
+
+def _fmt_pct(x: float) -> str:
+    if x is None or not (x == x):
+        return "nan"
+    return f"{x:+.2f}%"
+
+def _fmt_x(x: float) -> str:
+    if x is None or not (x == x):
+        return "nan"
+    return f"{x:.2f}x"
+
 def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: float,
                           df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, i15: int) -> str:
+    """
+    Compact report intended to ALWAYS fit in ONE Telegram message.
+    Keeps only what’s needed for high-quality analysis.
+    """
     # Price: prefer mark
     mark = fetch_mark_price(symbol)
-    px = mark if mark is not None else float(df15.loc[i15, "close"])
+    px_mark = mark if mark is not None else safe_float(df15.loc[i15, "close"], default=float("nan"))
 
     # HTF last closed
     i1h = len(df1h) - 2
@@ -402,8 +437,11 @@ def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: floa
     c4h, e4h = float(df4h.loc[i4h, "close"]), float(df4h.loc[i4h, "ema200"])
     ctx_1h = "ABOVE" if c1h > e1h else "BELOW"
     ctx_4h = "ABOVE" if c4h > e4h else "BELOW"
+    htf1_pct = pct(c1h, e1h)
+    htf4_pct = pct(c4h, e4h)
 
     # 15m metrics (last closed candle)
+    close_px = float(df15.loc[i15, "close"])
     vwap = float(df15.loc[i15, "vwap"])
     ema20 = float(df15.loc[i15, "ema20"])
     ema50 = float(df15.loc[i15, "ema50"])
@@ -411,178 +449,50 @@ def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: floa
     rsi = float(df15.loc[i15, "rsi14"])
     macdh = float(df15.loc[i15, "macdh"])
     atr = float(df15.loc[i15, "atr14"])
-    close_px = float(df15.loc[i15, "close"])
 
-    # MACD hist slope
+    # MACD hist slope + threshold
     prev = i15 - 1
     mh_prev = safe_float(df15.loc[prev, "macdh"], default=float("nan")) if prev >= 0 else float("nan")
-    mh_slope = macdh - mh_prev if mh_prev == mh_prev else float("nan")
-    slope_dir = "INCREASING" if mh_slope == mh_slope and mh_slope > 0 else "DECREASING" if mh_slope == mh_slope and mh_slope < 0 else "FLAT/NA"
+    mh_slope = macdh - mh_prev if (mh_prev == mh_prev) else float("nan")
+    slope_dir = "UP" if (mh_slope == mh_slope and mh_slope > 0) else "DN" if (mh_slope == mh_slope and mh_slope < 0) else "FLAT"
+    slope_thr = max(1e-12, atr * MACD_SLOPE_ATR_FACTOR) if (atr == atr) else float("nan")
 
     # Delta proxy (taker buy/sell)
     tb = safe_float(df15.loc[i15, "taker_buy"], default=float("nan"))
     ts = safe_float(df15.loc[i15, "taker_sell"], default=float("nan"))
-    delta = tb - ts if (tb == tb and ts == ts) else float("nan")
+    delta = (tb - ts) if (tb == tb and ts == ts) else float("nan")
 
     # Distances (in %)
-    dist_close_vwap = pct(close_px, vwap)
-    dist_close_e50 = pct(close_px, ema50)
-    dist_close_e200 = pct(close_px, ema200)
-    atr_pct = pct(atr, close_px)
+    dist_vwap = pct(close_px, vwap)
+    dist_e50 = pct(close_px, ema50)
+    dist_e200 = pct(close_px, ema200)
+
+    # Dist in ATR units (useful to detect "after the move")
+    dist_atr_e20 = (abs(close_px - ema20) / atr) if (atr == atr and atr > 0) else float("nan")
 
     # Timing
-    last_15m_close_utc = utc_ts(int(df15.loc[i15, "ts"]) + interval_seconds("15m") * 1000)
+    last_close_utc = utc_ts(int(df15.loc[i15, "ts"]) + interval_seconds("15m") * 1000)
     next_close_utc, eta_sec = next_15m_close_eta()
 
     # Diagnostics (LONG/SHORT readiness)
     diag = summarize_trigger_state(df15, df1h, df4h, i15)
 
-    # OHLC last 3 (ending at i15)
-    start = max(0, i15 - 2)
-    rows = []
-    for j in range(start, i15 + 1):
-        rows.append(
-            f"- {utc_ts(int(df15.loc[j,'ts']))} "
-            f"O {float(df15.loc[j,'open']):.6f} "
-            f"H {float(df15.loc[j,'high']):.6f} "
-            f"L {float(df15.loc[j,'low']):.6f} "
-            f"C {float(df15.loc[j,'close']):.6f} "
-            f"| V {float(df15.loc[j,'volume']):.2f}"
-        )
+    missL = ",".join(diag["missing_long"]) if diag["missing_long"] else "-"
+    missS = ",".join(diag["missing_short"]) if diag["missing_short"] else "-"
 
-    # Human-readable message
-    msg = []
-    msg.append(f"🧠 SNAPSHOT REPORT ({tag} — Scanner only, NOT a trade signal)")
-    msg.append(f"UTC: {utc_now_str()}")
-    msg.append("")
-    msg.append(f"{symbol} | {tag} | DIR(15m): {direction}")
-    msg.append(f"Price (mark): {px:.6f}")
-    msg.append("")
-    msg.append("Higher Timeframe Context (vs EMA200):")
-    msg.append(f"- 1h: close {c1h:.6f} is {ctx_1h} EMA200 {e1h:.6f}")
-    msg.append(f"- 4h: close {c4h:.6f} is {ctx_4h} EMA200 {e4h:.6f}")
-    msg.append("")
-    msg.append("15m Trend + Momentum (last closed candle):")
-    msg.append(f"- VWAP {vwap:.6f} | EMA20 {ema20:.6f} | EMA50 {ema50:.6f} | EMA200 {ema200:.6f}")
-    msg.append(f"- RSI(14): {rsi:.2f} (filter {RSI_MIN}–{RSI_MAX})")
-    msg.append(f"- MACD Hist: {macdh:.6f} | Hist slope: {mh_slope:.6f} ({slope_dir})")
-    msg.append("")
-    msg.append("Volume & Volatility:")
-    msg.append(f"- Vol ratio (current/SMA20): {vol_ratio:.2f}x (need ≥ {VOL_SPIKE_MULT}x for trigger)")
-    msg.append(f"- ATR(14): {atr:.6f} | ATR% of Price: {atr_pct:.3f}%")
-    msg.append("")
-    msg.append("Distances (Close vs levels):")
-    msg.append(f"- vs VWAP: {dist_close_vwap:.3f}% | vs EMA50: {dist_close_e50:.3f}% | vs EMA200: {dist_close_e200:.3f}%")
-    msg.append("")
-    msg.append("Timing:")
-    msg.append(f"- Last 15m closed: {last_15m_close_utc} | Next 15m close (ETA): {int(eta_sec)}s → {next_close_utc}")
-    msg.append("")
-    msg.append("Delta proxy (15m taker buy - taker sell):")
-    msg.append(f"- TakerBuy {tb:.2f} | TakerSell {ts:.2f} | Delta {delta:.2f}")
-    msg.append("")
+    # 1-message compact block
+    lines = []
+    lines.append(f"🧠 {tag} | {symbol} | 15m: {direction}")
+    lines.append(f"UTC: {utc_now_str()} | Last close: {last_close_utc} | Next: {next_close_utc} ({int(eta_sec)}s)")
+    lines.append(f"Mark: {_fmt_px(px_mark)} | Close: {_fmt_px(close_px)}")
+    lines.append(f"HTF EMA200: 1h {ctx_1h}({_fmt_pct(htf1_pct)}) | 4h {ctx_4h}({_fmt_pct(htf4_pct)})")
+    lines.append(f"15m lvls: VWAP {_fmt_px(vwap)} | E20 {_fmt_px(ema20)} | E50 {_fmt_px(ema50)} | E200 {_fmt_px(ema200)}")
+    lines.append(f"RSI {rsi:.1f} | VOLx {_fmt_x(vol_ratio)} | ATR {_fmt_px(atr)} | dist(E20) {dist_atr_e20:.2f}ATR")
+    lines.append(f"MACDh {_fmt_px(macdh)} | slope {_fmt_px(mh_slope)} {slope_dir} | thr {_fmt_px(slope_thr)}")
+    lines.append(f"Dist%: VWAP {_fmt_pct(dist_vwap)} | E50 {_fmt_pct(dist_e50)} | E200 {_fmt_pct(dist_e200)} | Δ {delta:+.2f}")
+    lines.append(f"TRIG L={diag['trigger_long']} (miss:{missL}) | S={diag['trigger_short']} (miss:{missS})")
 
-    # Trigger diagnostics block
-    msg.append("#TRIGGER_STATUS")
-    msg.append(
-        f"LONG: HTF={diag['htf_long_ok']} | VWAP_UP={diag['vwap_cross_up']} | "
-        f"EMA_UP={diag['ema_cross_up']} | VOL={diag['vol_ratio']:.2f}x/{VOL_SPIKE_MULT}x | "
-        f"RSI={diag['rsi_ok']} | MACD_SLOPE_UP={diag['macd_up_ok']} (thr={diag['slope_thr']:.6f})"
-    )
-    msg.append(
-        f"SHORT: HTF={diag['htf_short_ok']} | VWAP_DN={diag['vwap_cross_dn']} | "
-        f"EMA_DN={diag['ema_cross_dn']} | VOL={diag['vol_ratio']:.2f}x/{VOL_SPIKE_MULT}x | "
-        f"RSI={diag['rsi_ok']} | MACD_SLOPE_DN={diag['macd_dn_ok']} (thr={diag['slope_thr']:.6f})"
-    )
-    msg.append(
-        f"=> TRIGGER_LONG={diag['trigger_long']} | MISSING_LONG={diag['missing_long']} "
-        f"|| TRIGGER_SHORT={diag['trigger_short']} | MISSING_SHORT={diag['missing_short']}"
-    )
-    msg.append("")
-
-    # Raw OHLC snippet
-    msg.append("Raw Data Snippet — last 3 candles (OHLCV):")
-    msg.extend(rows)
-
-    # Machine-readable JSON block for ChatGPT (single-line to keep compact)
-    data_json = {
-        "symbol": symbol,
-        "utc": utc_now_str(),
-        "tf": "15m",
-        "htf": {"1h_ctx": ctx_1h, "4h_ctx": ctx_4h},
-        "close": close_px,
-        "mark": px,
-        "vwap": vwap,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi14": rsi,
-        "macdh": macdh,
-        "macd_slope": mh_slope,
-        "atr14": atr,
-        "atr_pct": atr_pct,
-        "vol_ratio": vol_ratio,
-        "dist": {
-            "close_vs_vwap_pct": dist_close_vwap,
-            "close_vs_ema50_pct": dist_close_e50,
-            "close_vs_ema200_pct": dist_close_e200
-        },
-        "trigger_params": {
-            "vol_spike_mult": VOL_SPIKE_MULT,
-            "macd_slope_atr_factor": MACD_SLOPE_ATR_FACTOR
-        },
-        "trigger_status": {
-            "long": {
-                "htf_ok": diag["htf_long_ok"],
-                "vwap_cross_up": diag["vwap_cross_up"],
-                "ema_cross_up": diag["ema_cross_up"],
-                "rsi_ok": diag["rsi_ok"],
-                "macd_slope_up_ok": diag["macd_up_ok"],
-                "met": diag["trigger_long"],
-                "missing": diag["missing_long"]
-            },
-            "short": {
-                "htf_ok": diag["htf_short_ok"],
-                "vwap_cross_dn": diag["vwap_cross_dn"],
-                "ema_cross_dn": diag["ema_cross_dn"],
-                "rsi_ok": diag["rsi_ok"],
-                "macd_slope_dn_ok": diag["macd_dn_ok"],
-                "met": diag["trigger_short"],
-                "missing": diag["missing_short"]
-            }
-        }
-    }
-    msg.append("\n#DATA_JSON\n" + str(data_json))
-
-    return "\n".join(msg)
-
-def build_manual_report(symbol: str, cache: "MarketCache") -> str:
-    cache.refresh_15m(symbol)
-    cache.ensure_context_ready(symbol)
-
-    df15 = cache.get(symbol, "15m")
-    df1h = cache.get(symbol, "1h")
-    df4h = cache.get(symbol, "4h")
-
-    i15 = len(df15) - 2
-    if i15 < 30:
-        return f"❌ Not enough data yet for {symbol}"
-
-    vol = safe_float(df15.loc[i15, "volume"], default=float("nan"))
-    vol_avg = safe_float(df15.loc[i15, "vol_sma20"], default=float("nan"))
-    vol_ratio = (vol / vol_avg) if (vol_avg == vol_avg and vol_avg > 0) else float("nan")
-
-    direction = "NEUTRAL"
-    close = safe_float(df15.loc[i15, "close"])
-    vwap = safe_float(df15.loc[i15, "vwap"])
-    ema20 = safe_float(df15.loc[i15, "ema20"])
-    ema50 = safe_float(df15.loc[i15, "ema50"])
-    if close is not None and vwap is not None and ema20 is not None and ema50 is not None:
-        if close > vwap and ema20 > ema50:
-            direction = "LONG-ish"
-        elif close < vwap and ema20 < ema50:
-            direction = "SHORT-ish"
-
-    return build_snapshot_report(symbol, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15)
+    return "\n".join(lines)
 
 # ============================================================
 # Command parsing
@@ -649,7 +559,7 @@ def main():
                             reports = []
                             for s in SYMBOLS:
                                 reports.append(build_manual_report(s, cache))
-                            combined = "\n\n" + ("=" * 32) + "\n\n"
+                            combined = "\n\n" + ("—" * 18) + "\n\n"
                             tg_send_message(combined.join(reports))
                         else:
                             sym = arg
