@@ -1,21 +1,16 @@
 """
 MOMENTUM PRO — EXECUTION-AWARE MULTI-ALERT + DETAILED REPORT (Telegram Enabled, SAFE)
-v8.1.0 (FIXED ENTRY_OK + BETTER PULLBACK + 5m ENTRY GATING + SINGLE-MESSAGE /report)
+v8.2.0 (SETUP_WATCH + ENTRY_OK, low spam)
 
-What changed vs your v8.0.0:
-1) FIX: ENTRY_OK logic was over-tight + had a pullback contradiction:
-   - Pullback zone no longer requires 15m price <= EMA20 (which kills entries in strong trends).
-   - Pullback zone is now ATR-distance based (near EMA20), trend-friendly.
-2) bias_ok relaxed (still strict enough for leverage, but not "only perfect trends"):
-   - 4h must be aligned (stack + slope)
-   - 1h must be supportive (above/below EMA20 + slope in same direction)
-3) ENTRY_OK anti-spam/gating uses LAST CLOSED 5m candle (not 15m) so it doesn't miss valid 5m entries.
-4) /report now sends ONE Telegram message by default (compact but still analysis-usable).
-   - /reportfull keeps your old multi-message (no truncation ever).
-5) Cleaned dead/unreachable code in fetch_derivatives_cached().
+GOAL
+- Scanner only — NOT a trade signal.
+- Alerts:
+  1) SETUP_WATCH: "worth starting analysis" (rare, low spam)
+  2) ENTRY_OK: execution-confirmed entry (fast action)
+- /report default single-message compact
+- /reportfull old multi-message (no truncation)
 
 NOTES
-- Scanner only — NOT a trade signal.
 - Binance Futures public endpoints only.
 - Telegram getUpdates long-polling (stable).
 """
@@ -43,18 +38,18 @@ ATR_LEN = 14
 VOL_LOOKBACK = 20
 SLOPE_LOOKBACK = 6
 DELTA_MED_LOOKBACK = 20
-SWING_LOOKBACK_15M = 5  # your old structure lookback (kept)
+SWING_LOOKBACK_15M = 5
 
 RETURN_LOOKBACK_15M = 6
 RETURN_LOOKBACK_1H = 6
 RETURN_LOOKBACK_4H = 6
 
-# --- QUIET FILTER (keep) ---
+# --- QUIET FILTER ---
 QUIET_RSI_1H_LONG_ON = 70.0
 QUIET_RSI_1H_SHORT_ON = 30.0
 QUIET_ATR_DIST_15M_ON = 1.20
 
-# --- base alerts thresholds (tuned, kept) ---
+# --- base alerts thresholds ---
 VOLX_SCOUT = 0.85
 VOLX_PULLBACK = 0.95
 VOLX_CONFIRM = 1.10
@@ -64,33 +59,35 @@ RSI_SCOUT_SHORT = 48
 RSI_CONFIRM_LONG = 58
 RSI_CONFIRM_SHORT = 42
 
-# Delta / intent (kept)
+# Delta / intent
 DELTA_DOM_MULT = 1.15
 BODY_ATR_MIN = 0.35
 
-# Pullback logic (kept)
+# Pullback logic
 PULLBACK_TOUCH_ATR = 0.30
 PULLBACK_LOOKBACK_SEC = 2 * 60 * 60
 
-# Late filter for confirm (kept)
+# Late filter for confirm
 LATE_ATR_BLOCK_CONFIRM = 1.60
 SOFT_LATE_ATR_CONFIRM = 1.10
 
 # Scan / command loop
-SCAN_SECONDS = 60
+SCAN_SECONDS = 30
 
-# Anti-spam (kept + entry)
+# Anti-spam
 COOLDOWN_SCOUT = 12 * 60
 COOLDOWN_PULLBACK = 35 * 60
 COOLDOWN_CONFIRM = 60 * 60
-COOLDOWN_ENTRY = 20 * 60  # new
+COOLDOWN_ENTRY = 0
+COOLDOWN_WATCH = 15 * 60  # NEW: rare setup watch alerts
 ONE_PER_CANDLE = True
 
 # Minimum move required vs last same alert (prevents repeats)
 MIN_MOVE_SCOUT = {"BTCUSDT": 0.10, "ETHUSDT": 0.14, "SOLUSDT": 0.18}
 MIN_MOVE_PULLBACK = {"BTCUSDT": 0.15, "ETHUSDT": 0.20, "SOLUSDT": 0.25}
 MIN_MOVE_CONFIRM = {"BTCUSDT": 0.25, "ETHUSDT": 0.30, "SOLUSDT": 0.40}
-MIN_MOVE_ENTRY = {"BTCUSDT": 0.10, "ETHUSDT": 0.12, "SOLUSDT": 0.16}  # slightly easier
+MIN_MOVE_ENTRY = {"BTCUSDT": 0.10, "ETHUSDT": 0.12, "SOLUSDT": 0.16}
+MIN_MOVE_WATCH = {"BTCUSDT": 0.20, "ETHUSDT": 0.25, "SOLUSDT": 0.35}  # NEW: slightly higher to avoid spam
 
 # Telegram (strip to avoid hidden newline/space bugs)
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
@@ -109,32 +106,32 @@ KLINE_TAIL_FETCH = 2
 
 # ---- 5m (for entry confirmation + hint) ----
 TF5_ENABLED = True
-TF5_LIMIT = 220  # enough history for indicators
+TF5_LIMIT = 220
 
 # ---- entry confirmation (execution-aware) ----
-ENTRY5M_VOLX_MIN = 1.00       # require at least normal volume
-ENTRY5M_RSI_EFF_MIN = 50.0    # rsi_eff threshold
-ENTRY15M_DIST_EMA20_MAX_ATR = 1.10  # avoid "after the move" entries
-ENTRY5M_DIST_EMA20_MAX_ATR = 0.70   # prefer close to EMA20 for entry (fresh)
-ENTRY_ALLOW_CONTINUATION = True     # allow entries if not in pullback zone but confirm is strong
+ENTRY5M_VOLX_MIN = 1.00
+ENTRY5M_RSI_EFF_MIN = 50.0
+ENTRY15M_DIST_EMA20_MAX_ATR = 1.10
+ENTRY5M_DIST_EMA20_MAX_ATR = 0.70
+ENTRY_ALLOW_CONTINUATION = True
 
 # ---- leverage scoring ----
 LEV_SCORE_4X_MIN = 8
 LEV_SCORE_3X_MIN = 6
 
 # ---- SL/TP suggestion ----
-SWING_LOOKBACK_5M = 36          # ~3 hours
-SL_ATR_BUFFER_5M = 0.10         # under/over swing by ATR buffer
+SWING_LOOKBACK_5M = 36
+SL_ATR_BUFFER_5M = 0.10
 TP_R1 = 1.0
 TP_R2 = 2.0
 
 # ---- auto-push levels ----
-# Default: ENTRY_OK only (as intended).
-AUTO_PUSH_LEVELS = {"ENTRY_OK"}  # add "CONFIRM" if you want: {"ENTRY_OK","CONFIRM"}
+# NEW: Setup-watch + Entry-only (low spam, actionable)
+AUTO_PUSH_LEVELS = {"SETUP_WATCH", "ENTRY_OK"}
 
 # ---- report mode ----
-REPORT_SINGLE_MESSAGE = True  # /report -> one message compact
-TELEGRAM_MAX_LEN = 3900       # safe margin under Telegram 4096
+REPORT_SINGLE_MESSAGE = True
+TELEGRAM_MAX_LEN = 3900
 
 # ================== STATE ================== #
 
@@ -142,7 +139,7 @@ _last_update_id = 0
 _prev_oi = {}
 
 _last_sent = {}                   # (symbol, side, level) -> {"ts":..., "price":..., "candle_ot":...}
-_last_candle_by_key = {}          # (symbol, side, level) -> open_time (LAST CLOSED candle OT)
+_last_candle_by_key = {}          # (symbol, side, level) -> open_time
 _last_alert_price_by_key = {}     # (symbol, side, level) -> price
 _last_impulse = {}                # (symbol, side) -> {"ts":..., "level":..., "price":...}
 
@@ -224,11 +221,7 @@ def is_allowed_chat(chat_id: str) -> bool:
 
 def _send_telegram_once(text: str, chat_id: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": str(chat_id),
-        "text": text,
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": True}
     resp = requests.post(url, json=payload, timeout=15)
     if resp.status_code >= 400:
         raise Exception(f"Telegram error {resp.status_code}: {resp.text[:600]}")
@@ -365,7 +358,7 @@ def pct_change(a, b):
 def atr_distance(price, ema20, atr):
     if atr is None or (isinstance(atr, float) and np.isnan(atr)) or atr <= 0:
         return 0.0
-    return abs(price - ema20) / atr
+    return abs(float(price) - float(ema20)) / float(atr)
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -440,9 +433,6 @@ def fetch_derivatives_cached(symbol):
 # ================== SNAPSHOT (LAST CLOSED CANDLE) ================== #
 
 def tf_snapshot_closed(k, tf_name):
-    """
-    Evaluate on LAST CLOSED candle (drop live forming candle).
-    """
     if k is None or len(k) < 5:
         return None
 
@@ -469,7 +459,6 @@ def tf_snapshot_closed(k, tf_name):
     vol_ratio = vol[-1] / (np.mean(vol[-VOL_LOOKBACK:]) + 1e-12) if len(vol) >= VOL_LOOKBACK else 1.0
     open_time = int(kc[-1, 0])
 
-    # Delta series (taker buy vol exists at index 9)
     if kc.shape[1] > 9:
         taker_buy_series = kc[:, 9].astype(float)
         total_vol_series = vol.astype(float)
@@ -639,7 +628,7 @@ def entry_confirm_5m(snap5, side: str):
         reason = f"reclaim={reclaim}, LL={ll}, volx={volx:.2f}, rsiEff={reff:.1f}, distATR={dist:.2f}"
         return ok, reason
 
-# ================== CONTEXT SCORING (kept) ================== #
+# ================== CONTEXT SCORING ================== #
 
 def _ctx_score(tf_snap, side):
     p = tf_snap["price"]
@@ -700,7 +689,7 @@ def _pick_best_side_for_report(rep):
 
     return "LONG" if totalL >= totalS else "SHORT"
 
-# ================== SCOUT / PULLBACK / CONFIRM (kept) ================== #
+# ================== SCOUT / PULLBACK / CONFIRM ================== #
 
 def _scout_signal(tf15, tf1h, side, ret15):
     reasons = []
@@ -841,7 +830,7 @@ def _confirm_signal(tf15, tf1h, tf4h, side, ret15):
 
     return {"level": "CONFIRM", "side": side, "reasons": reasons}
 
-# ================== QUIET FILTER (kept) ================== #
+# ================== QUIET FILTER ================== #
 
 def quiet_mode_blocks(signal, tf15, tf1h):
     level = signal.get("level")
@@ -862,14 +851,9 @@ def quiet_mode_blocks(signal, tf15, tf1h):
     else:
         return (rsi1h <= QUIET_RSI_1H_SHORT_ON) and (dist >= QUIET_ATR_DIST_15M_ON)
 
-# ================== EXECUTION-AWARE ENTRY_OK ================== #
+# ================== EXECUTION-AWARE ENTRY_OK + SETUP_WATCH ================== #
 
 def bias_ok(rep, side: str) -> bool:
-    """
-    Relaxed but leverage-safe:
-    - 4h must be aligned (stack + slope)
-    - 1h must be supportive (price vs EMA20 + slope)
-    """
     tf1 = rep["tf_raw"]["1h"]
     tf4 = rep["tf_raw"]["4h"]
 
@@ -882,24 +866,15 @@ def bias_ok(rep, side: str) -> bool:
         ltf_ok = (tf1["price"] < tf1["ema20"]) and (tf1["ema20_slp"] < 0)
         return htf_ok and ltf_ok
 
-def in_pullback_zone_15m(tf15, side: str) -> tuple[bool, float]:
-    """
-    FIX: old version required price <= EMA20 for LONG (kills entries in strong trends).
-    New: ATR-distance based "near EMA20" zone, trend-friendly.
-    """
+def in_pullback_zone_15m(tf15, side: str):
     p = float(tf15["price"])
     e20 = float(tf15["ema20"])
     a = float(tf15["atr"])
     dist = atr_distance(p, e20, a)
-
-    # "Near EMA20" pullback zone (works both in trend and mild retraces)
     ok = dist <= 0.85
     return ok, dist
 
 def entry_ok(rep, side: str, snap5):
-    """
-    ENTRY_OK = Bias OK + (pullback zone OR continuation-confirm) + 5m confirm + not late on 15m
-    """
     tf15 = rep["tf_raw"]["15m"]
     dist15 = atr_distance(float(tf15["price"]), float(tf15["ema20"]), float(tf15["atr"]))
     if dist15 > ENTRY15M_DIST_EMA20_MAX_ATR:
@@ -930,7 +905,44 @@ def entry_ok(rep, side: str, snap5):
     mode = "PULLBACK" if pb_ok else "CONTINUATION"
     return True, f"ENTRY_OK ({mode}) | 15mDist={dist15:.2f}ATR | 5m: {reason5}"
 
-# ================== LEVERAGE + SL/TP ================== #
+def setup_watch(rep, side: str):
+    """
+    SETUP_WATCH = worth starting analysis (rare).
+    Conditions:
+    - bias_ok true
+    - 15m not late (<=1.05 ATR)
+    - 5m hint OK or PULLBACK_ZONE (avoid EXTENDED/DANGER)
+    - and (15m pullback zone OR continuation-confirm candidate exists)
+    """
+    if not bias_ok(rep, side):
+        return None
+
+    tf15 = rep["tf_raw"]["15m"]
+    dist15 = atr_distance(float(tf15["price"]), float(tf15["ema20"]), float(tf15["atr"]))
+    if dist15 > 1.05:
+        return None
+
+    hint = rep.get("entry_hint_5m", {}).get(side, {}).get("hint", "N/A")
+    if hint not in ("OK", "PULLBACK_ZONE"):
+        return None
+
+    pb_ok, pb_dist = in_pullback_zone_15m(tf15, side)
+
+    cont_ok = False
+    if not pb_ok:
+        tf1 = rep["tf_raw"]["1h"]
+        tf4 = rep["tf_raw"]["4h"]
+        ret15 = rep["returns"]["15m"]
+        c = _confirm_signal(tf15, tf1, tf4, side, ret15)
+        cont_ok = c is not None
+
+    if not pb_ok and not cont_ok:
+        return None
+
+    why = f"SETUP_WATCH | hint={hint} | 15mDist={dist15:.2f}ATR | PB={pb_ok}(dist={pb_dist:.2f}) | CONT={cont_ok}"
+    return {"level": "SETUP_WATCH", "side": side, "reasons": [why]}
+
+# ================== LEVERAGE + SL/TP (kept from v8.1) ================== #
 
 def leverage_score(rep, side: str, snap5):
     tf15 = rep["tf_raw"]["15m"]
@@ -1061,6 +1073,12 @@ def analyze_symbol(symbol):
     tf1h = tf_snaps["1h"]
     signals = [s for s in signals if not quiet_mode_blocks(s, tf15, tf1h)]
 
+    # IMPORTANT FIX:
+    # Track impulse even if we don't auto-send SCOUT/CONFIRM (needed for PULLBACK logic)
+    for s in signals:
+        if s["level"] in ("SCOUT", "CONFIRM"):
+            _last_impulse[(symbol, s["side"])] = {"ts": time.time(), "level": s["level"], "price": float(tf15["price"])}
+
     tf_public = {
         k: {kk: vv for kk, vv in v.items()
             if kk not in ("close_series", "high_series", "low_series", "delta_series", "vol_series")}
@@ -1100,9 +1118,23 @@ def analyze_symbol(symbol):
                 "sltp_note": note
             })
 
+    watch_signals = []
+    # Setup-watch should consider bias + hint + not-late + pb/continuation
+    rep_for_watch = {
+        "tf_raw": tf_snaps,
+        "returns": returns,
+        "entry_hint_5m": hints5,
+        "snap5_raw": snap5
+    }
+    for side in ("LONG", "SHORT"):
+        ws = setup_watch(rep_for_watch, side)
+        if ws:
+            watch_signals.append(ws)
+
     return {
         "symbol": symbol,
         "signals": signals,
+        "watch_signals": watch_signals,
         "entry_signals": entry_signals,
         "tf": tf_public,
         "tf_raw": tf_snaps,
@@ -1125,6 +1157,8 @@ def _min_move_for(symbol, level):
         return MIN_MOVE_CONFIRM.get(symbol, 0.30)
     if level == "ENTRY_OK":
         return MIN_MOVE_ENTRY.get(symbol, 0.14)
+    if level == "SETUP_WATCH":
+        return MIN_MOVE_WATCH.get(symbol, 0.25)
     return 0.20
 
 def _cooldown_for(level):
@@ -1136,12 +1170,14 @@ def _cooldown_for(level):
         return COOLDOWN_CONFIRM
     if level == "ENTRY_OK":
         return COOLDOWN_ENTRY
+    if level == "SETUP_WATCH":
+        return COOLDOWN_WATCH
     return 10 * 60
 
 def _get_gate_reference(rep, level: str):
     """
-    ENTRY_OK should gate on 5m (since it's a 5m close execution confirm).
-    Others gate on 15m.
+    ENTRY_OK gates on 5m (execution).
+    SETUP_WATCH + others gate on 15m.
     """
     if level == "ENTRY_OK":
         s5 = rep.get("snap5_raw")
@@ -1251,10 +1287,12 @@ def _trg_score(tf15, side, ret15):
     st = _structure_flags_15m(tf15, side)
     if st["break"]:
         reasons.append("Structure (break)"); score += 1
-        (up := up + 1) if side == "LONG" else (down := down + 1)
+        if side == "LONG": up += 1
+        else: down += 1
     elif st["reclaim"]:
         reasons.append("Structure (reclaim/reject EMA20)"); score += 1
-        (up := up + 1) if side == "LONG" else (down := down + 1)
+        if side == "LONG": up += 1
+        else: down += 1
     else:
         reasons.append("No structure (no break/reclaim)")
 
@@ -1280,7 +1318,7 @@ def _trg_score(tf15, side, ret15):
     reasons.append(f"VOLx snapshot {volx:.2f}")
     return score, reasons, up, down
 
-# ---- OLD STYLE (unchanged, still available for /reportfull) ----
+# ================== REPORTS ================== #
 
 def build_report_oldstyle(rep):
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -1405,8 +1443,6 @@ def build_report_all_text(reps):
             out += "\n\n——————————————————————\n\n"
     return out
 
-# ---- COMPACT (single-message) REPORT ----
-
 def _report_compact_one(rep):
     sym = rep["symbol"]
     t15 = rep["tf"]["15m"]
@@ -1435,13 +1471,11 @@ def _report_compact_one(rep):
 
     lines = []
     lines.append(f"*{sym}* | *{alert}* | DIR15 {dir15} | total `{total}` (UP `{up_tr}`/DOWN `{dn_tr}`)")
-
     lines.append(
         f"p `{fmt_num(t15['price'],2)}` | EMA20/50 `{fmt_num(t15['ema20'],2)}`/`{fmt_num(t15['ema50'],2)}` | "
         f"RSI 15/1h/4h `{fmt_num(t15['rsi'],1)}`/`{fmt_num(t1['rsi'],1)}`/`{fmt_num(t4['rsi'],1)}` | "
         f"ATR15 `{fmt_num(t15['atr'],2)}` VOLx15 `{fmt_num(t15['vol_ratio'],2)}` ret15 `{fmt_num(ret15,2)}%`"
     )
-
     d = (
         f"fund `{fmt_num(deriv['funding'],4)}%` basis `{fmt_num(deriv['basis'],4)}%` "
         f"OI `{fmt_num(deriv['oi'],0)}`"
@@ -1453,7 +1487,6 @@ def _report_compact_one(rep):
     if buy is not None:
         lines.append(f"Δ15m: buy `{fmt_num(buy,0)}` sell `{fmt_num(sell,0)}` Δ `{fmt_num(delt,0)}`")
 
-    # 5m hint (for chosen side)
     if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
         t5 = rep["tf5m"]
         h = rep["entry_hint_5m"].get(side_for_report, {})
@@ -1462,7 +1495,6 @@ def _report_compact_one(rep):
             f"VOLx `{fmt_num(t5['vol_ratio'],2)}` | HINT `{h.get('hint','N/A')}`"
         )
 
-    # ENTRY_OK top 1
     if rep.get("entry_signals"):
         es = rep["entry_signals"][0]
         lines.append(
@@ -1473,9 +1505,7 @@ def _report_compact_one(rep):
     else:
         lines.append("ENTRY_OK: none")
 
-    # keep only top 3 trigger reasons (enough for analysis)
     lines.append("Why: " + "; ".join(trg_reasons[:3]))
-
     return "\n".join(lines)
 
 def build_report_all_compact(reps):
@@ -1487,15 +1517,10 @@ def build_report_all_compact(reps):
             out.append("\n——————————\n")
     text = "\n".join(out).strip()
 
-    # Hard-fit to single message by trimming least important extras if needed
     if len(text) <= TELEGRAM_MAX_LEN:
         return text
 
-    # If too long: remove "Why" lines first, then 5m lines, then delta
     lines = text.splitlines()
-    def drop_if_contains(substr):
-        return [ln for ln in lines if substr not in ln]
-
     for step in range(3):
         if len("\n".join(lines)) <= TELEGRAM_MAX_LEN:
             break
@@ -1508,11 +1533,7 @@ def build_report_all_compact(reps):
 
     final = "\n".join(lines).strip()
     if len(final) > TELEGRAM_MAX_LEN:
-        # last resort: keep headers + per-symbol first two lines only
-        compact2 = []
-        for ln in final.splitlines():
-            compact2.append(ln)
-        final = "\n".join(compact2)[:TELEGRAM_MAX_LEN-40] + "\n…use /reportfull for full detail"
+        final = final[:TELEGRAM_MAX_LEN-40] + "\n…use /reportfull for full detail"
     return final
 
 # ================== ALERT MESSAGE (AUTO PUSH) ================== #
@@ -1530,6 +1551,23 @@ def build_signal_message(rep, signal):
     t1h = rep["tf"]["1h"]
     t4h = rep["tf"]["4h"]
 
+    # NEW: compact watch message
+    if level == "SETUP_WATCH":
+        dist15 = atr_distance(t15["price"], t15["ema20"], t15["atr"])
+        msg = f"👀 {sym} — SETUP_WATCH | {side}\nUTC: {ts}\n"
+        msg += "(Scanner only — NOT a signal. Uses LAST CLOSED candles.)\n\n"
+        msg += f"15m: p {fmt_num(t15['price'],2)} | distATR {fmt_num(dist15,2)} | VOLx {fmt_num(t15['vol_ratio'],2)} | RSI15 {fmt_num(t15['rsi'],1)}\n"
+        msg += f"1h RSI {fmt_num(t1h['rsi'],1)} | 4h RSI {fmt_num(t4h['rsi'],1)} | fund {fmt_num(deriv['funding'],4)}%\n"
+        if rep.get("tf5m") is not None and rep.get("entry_hint_5m"):
+            h = rep["entry_hint_5m"].get(side, {})
+            msg += f"5m HINT: {h.get('hint','N/A')} ({h.get('details','')})\n"
+        msg += "\nWhy:\n"
+        for line in signal.get("reasons", [])[:5]:
+            msg += f"- {line}\n"
+        msg += "\nTip: /report " + sym + " for full context."
+        return msg.strip()
+
+    # Default: full alert format (ENTRY_OK)
     msg = f"🚨 {sym} — {level} | {side}\nUTC: {ts}\n"
     msg += "(Scanner only — NOT a signal. Uses LAST CLOSED candles.)\n\n"
 
@@ -1604,21 +1642,20 @@ def handle_telegram_commands():
         if text.startswith("/status"):
             send_telegram(
                 "✅ Bot is running.\n"
-                "v8.1.0: fixed ENTRY_OK (trend-friendly pullback) + 5m gating + /report single message.\n"
+                "v8.2.0: SETUP_WATCH (rare) + ENTRY_OK (fast)\n"
                 f"Auto-push levels: {', '.join(sorted(AUTO_PUSH_LEVELS))}\n"
                 "Manual: /report, /report ETHUSDT, /reportfull, /reportfull ETHUSDT",
                 chat_id=chat_id
             )
             continue
 
-        # --- /report (single compact message by default) ---
         if text.startswith("/reportfull"):
             parts = text.split()
             try:
                 if len(parts) == 1:
                     reps = [analyze_symbol(s) for s in SYMBOLS]
                     out = build_report_all_text(reps)
-                    send_telegram(out, chat_id=chat_id)  # multi-message, no truncation
+                    send_telegram(out, chat_id=chat_id)
                 else:
                     sym = parts[1].upper()
                     if sym not in SYMBOLS:
@@ -1670,7 +1707,7 @@ def run_once():
             continue
 
         combined = []
-        combined.extend(rep.get("signals", []))
+        combined.extend(rep.get("watch_signals", []))
         combined.extend(rep.get("entry_signals", []))
 
         for sig in combined:
@@ -1689,11 +1726,12 @@ if __name__ == "__main__":
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
-            "✅ Momentum bot ONLINE (v8.1.0)\n"
+            "✅ Momentum bot ONLINE (v8.2.0)\n"
             f"- Scan every {SCAN_SECONDS}s\n"
             "- Candles: evaluates LAST CLOSED (fixes flip-flop)\n"
             f"- Auto-push: {', '.join(sorted(AUTO_PUSH_LEVELS))}\n"
-            "- ENTRY_OK: fixed pullback zone + 5m gating + leverage + SL/TP\n"
+            "- SETUP_WATCH: rare 'start analysis' alert\n"
+            "- ENTRY_OK: execution-confirmed alert\n"
             "- /report: single-message compact\n"
             "- /reportfull: original multi-message (no truncation)\n\n"
             "If /report doesn't respond in a GROUP: use /report@YourBotName or disable privacy mode in BotFather."
