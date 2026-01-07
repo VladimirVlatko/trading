@@ -496,8 +496,13 @@ def main():
 
                     if cmd == "/report":
                         if arg is None:
+                            reports = []
                             for s in SYMBOLS:
-                                tg_send_message(build_manual_report(s, cache))
+                                reports.append(build_manual_report(s, cache))
+                                
+                            combined = "\n\n" + ("=" * 32) + "\n\n"
+                            tg_send_message(combined.join(reports))
+
                         else:
                             sym = arg
                             if sym not in SYMBOLS:
