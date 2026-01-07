@@ -41,7 +41,7 @@ RSI_MIN, RSI_MAX = 25, 75
 MACD_SLOPE_ATR_FACTOR = 0.03  # 0.03 * ATR (tune 0.02–0.06)
 
 # Telegram chunking
-TG_CHUNK = 4096
+TG_CHUNK = 3500
 
 # Error reporting rate-limit
 ERROR_NOTIFY_COOLDOWN = 120  # seconds
@@ -146,19 +146,11 @@ def tg_get_updates(offset: int | None) -> dict:
     return r.json()
 
 def tg_send_message(text: str):
-    """
-    Send a SINGLE Telegram message (no chunking).
-    If text exceeds Telegram limits, it is compacted/truncated safely.
-    """
-    if text is None:
-        return
-    text = str(text)
-    if len(text) > TG_CHUNK:
-        # Hard safety: keep one message; preserve the most important top part.
-        text = text[: TG_CHUNK - 40] + "\n…(truncated to fit Telegram)"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    r = SESSION.post(tg_api("sendMessage"), json=payload, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
+    chunks = [text[i:i + TG_CHUNK] for i in range(0, len(text), TG_CHUNK)]
+    for ch in chunks:
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": ch}
+        r = SESSION.post(tg_api("sendMessage"), json=payload, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
 
 # ============================================================
 # Indicators
@@ -395,40 +387,13 @@ def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.Dat
     }
 
 # ============================================================
-# Report building (compact: single Telegram message friendly)
+# Report building
 # ============================================================
-def _fmt_px(x: float) -> str:
-    """Pretty price formatting based on magnitude."""
-    if x is None or not (x == x):
-        return "nan"
-    ax = abs(x)
-    if ax >= 10000:
-        return f"{x:.1f}"
-    if ax >= 1000:
-        return f"{x:.2f}"
-    if ax >= 100:
-        return f"{x:.3f}"
-    return f"{x:.4f}"
-
-def _fmt_pct(x: float) -> str:
-    if x is None or not (x == x):
-        return "nan"
-    return f"{x:+.2f}%"
-
-def _fmt_x(x: float) -> str:
-    if x is None or not (x == x):
-        return "nan"
-    return f"{x:.2f}x"
-
-def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: float,
+def _build_snapshot_report_full(symbol: str, tag: str, direction: str, vol_ratio: float,
                           df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, i15: int) -> str:
-    """
-    Compact report intended to ALWAYS fit in ONE Telegram message.
-    Keeps only what’s needed for high-quality analysis.
-    """
     # Price: prefer mark
     mark = fetch_mark_price(symbol)
-    px_mark = mark if mark is not None else safe_float(df15.loc[i15, "close"], default=float("nan"))
+    px = mark if mark is not None else float(df15.loc[i15, "close"])
 
     # HTF last closed
     i1h = len(df1h) - 2
@@ -437,11 +402,8 @@ def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: floa
     c4h, e4h = float(df4h.loc[i4h, "close"]), float(df4h.loc[i4h, "ema200"])
     ctx_1h = "ABOVE" if c1h > e1h else "BELOW"
     ctx_4h = "ABOVE" if c4h > e4h else "BELOW"
-    htf1_pct = pct(c1h, e1h)
-    htf4_pct = pct(c4h, e4h)
 
     # 15m metrics (last closed candle)
-    close_px = float(df15.loc[i15, "close"])
     vwap = float(df15.loc[i15, "vwap"])
     ema20 = float(df15.loc[i15, "ema20"])
     ema50 = float(df15.loc[i15, "ema50"])
@@ -449,50 +411,85 @@ def build_snapshot_report(symbol: str, tag: str, direction: str, vol_ratio: floa
     rsi = float(df15.loc[i15, "rsi14"])
     macdh = float(df15.loc[i15, "macdh"])
     atr = float(df15.loc[i15, "atr14"])
+    close_px = float(df15.loc[i15, "close"])
 
-    # MACD hist slope + threshold
+    # MACD hist slope
     prev = i15 - 1
     mh_prev = safe_float(df15.loc[prev, "macdh"], default=float("nan")) if prev >= 0 else float("nan")
-    mh_slope = macdh - mh_prev if (mh_prev == mh_prev) else float("nan")
-    slope_dir = "UP" if (mh_slope == mh_slope and mh_slope > 0) else "DN" if (mh_slope == mh_slope and mh_slope < 0) else "FLAT"
-    slope_thr = max(1e-12, atr * MACD_SLOPE_ATR_FACTOR) if (atr == atr) else float("nan")
+    mh_slope = macdh - mh_prev if mh_prev == mh_prev else float("nan")
+    slope_dir = "INCREASING" if mh_slope == mh_slope and mh_slope > 0 else "DECREASING" if mh_slope == mh_slope and mh_slope < 0 else "FLAT/NA"
 
     # Delta proxy (taker buy/sell)
     tb = safe_float(df15.loc[i15, "taker_buy"], default=float("nan"))
     ts = safe_float(df15.loc[i15, "taker_sell"], default=float("nan"))
-    delta = (tb - ts) if (tb == tb and ts == ts) else float("nan")
+    delta = tb - ts if (tb == tb and ts == ts) else float("nan")
 
     # Distances (in %)
-    dist_vwap = pct(close_px, vwap)
-    dist_e50 = pct(close_px, ema50)
-    dist_e200 = pct(close_px, ema200)
-
-    # Dist in ATR units (useful to detect "after the move")
-    dist_atr_e20 = (abs(close_px - ema20) / atr) if (atr == atr and atr > 0) else float("nan")
+    dist_close_vwap = pct(close_px, vwap)
+    dist_close_e50 = pct(close_px, ema50)
+    dist_close_e200 = pct(close_px, ema200)
+    atr_pct = pct(atr, close_px)
 
     # Timing
-    last_close_utc = utc_ts(int(df15.loc[i15, "ts"]) + interval_seconds("15m") * 1000)
+    last_15m_close_utc = utc_ts(int(df15.loc[i15, "ts"]) + interval_seconds("15m") * 1000)
     next_close_utc, eta_sec = next_15m_close_eta()
 
     # Diagnostics (LONG/SHORT readiness)
     diag = summarize_trigger_state(df15, df1h, df4h, i15)
+    return "
+".join(msg)
 
-    missL = ",".join(diag["missing_long"]) if diag["missing_long"] else "-"
-    missS = ",".join(diag["missing_short"]) if diag["missing_short"] else "-"
+# ============================================================
+# Snapshot report wrapper (supports both old and new call styles)
+# ============================================================
+def build_snapshot_report(*args, **kwargs) -> str:
+    """
+    Backwards/forwards compatible wrapper.
 
-    # 1-message compact block
-    lines = []
-    lines.append(f"🧠 {tag} | {symbol} | 15m: {direction}")
-    lines.append(f"UTC: {utc_now_str()} | Last close: {last_close_utc} | Next: {next_close_utc} ({int(eta_sec)}s)")
-    lines.append(f"Mark: {_fmt_px(px_mark)} | Close: {_fmt_px(close_px)}")
-    lines.append(f"HTF EMA200: 1h {ctx_1h}({_fmt_pct(htf1_pct)}) | 4h {ctx_4h}({_fmt_pct(htf4_pct)})")
-    lines.append(f"15m lvls: VWAP {_fmt_px(vwap)} | E20 {_fmt_px(ema20)} | E50 {_fmt_px(ema50)} | E200 {_fmt_px(ema200)}")
-    lines.append(f"RSI {rsi:.1f} | VOLx {_fmt_x(vol_ratio)} | ATR {_fmt_px(atr)} | dist(E20) {dist_atr_e20:.2f}ATR")
-    lines.append(f"MACDh {_fmt_px(macdh)} | slope {_fmt_px(mh_slope)} {slope_dir} | thr {_fmt_px(slope_thr)}")
-    lines.append(f"Dist%: VWAP {_fmt_pct(dist_vwap)} | E50 {_fmt_pct(dist_e50)} | E200 {_fmt_pct(dist_e200)} | Δ {delta:+.2f}")
-    lines.append(f"TRIG L={diag['trigger_long']} (miss:{missL}) | S={diag['trigger_short']} (miss:{missS})")
+    Supported call styles:
+    1) build_snapshot_report(symbol, cache)  -> returns MANUAL_REPORT snapshot (compact/full per _build_snapshot_report_full)
+    2) build_snapshot_report(symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15) -> full builder
+    """
+    # Style (1): (symbol, cache)
+    if len(args) == 2:
+        symbol, cache = args
+        return build_manual_report(symbol, cache)
 
-    return "\n".join(lines)
+    # Style (2): legacy/full signature
+    if len(args) >= 8:
+        symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15 = args[:8]
+        return _build_snapshot_report_full(symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15)
+
+    raise TypeError("build_snapshot_report() expected (symbol, cache) or full 8-arg signature")
+
+def build_manual_report(symbol: str, cache: "MarketCache") -> str:
+    cache.refresh_15m(symbol)
+    cache.ensure_context_ready(symbol)
+
+    df15 = cache.get(symbol, "15m")
+    df1h = cache.get(symbol, "1h")
+    df4h = cache.get(symbol, "4h")
+
+    i15 = len(df15) - 2
+    if i15 < 30:
+        return f"❌ Not enough data yet for {symbol}"
+
+    vol = safe_float(df15.loc[i15, "volume"], default=float("nan"))
+    vol_avg = safe_float(df15.loc[i15, "vol_sma20"], default=float("nan"))
+    vol_ratio = (vol / vol_avg) if (vol_avg == vol_avg and vol_avg > 0) else float("nan")
+
+    direction = "NEUTRAL"
+    close = safe_float(df15.loc[i15, "close"])
+    vwap = safe_float(df15.loc[i15, "vwap"])
+    ema20 = safe_float(df15.loc[i15, "ema20"])
+    ema50 = safe_float(df15.loc[i15, "ema50"])
+    if close is not None and vwap is not None and ema20 is not None and ema50 is not None:
+        if close > vwap and ema20 > ema50:
+            direction = "LONG-ish"
+        elif close < vwap and ema20 < ema50:
+            direction = "SHORT-ish"
+
+    return _build_snapshot_report_full(symbol, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15)
 
 # ============================================================
 # Command parsing
@@ -558,8 +555,8 @@ def main():
                         if arg is None:
                             reports = []
                             for s in SYMBOLS:
-                                reports.append(build_snapshot_report(s, cache))
-                            combined = "\n\n" + ("—" * 18) + "\n\n"
+                                reports.append(build_manual_report(s, cache))
+                            combined = "\n\n" + ("=" * 32) + "\n\n"
                             tg_send_message(combined.join(reports))
                         else:
                             sym = arg
