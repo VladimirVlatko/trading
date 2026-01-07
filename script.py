@@ -22,14 +22,13 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BINANCE_FAPI = "https://fapi.binance.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-# Loop cadence (controls Telegram responsiveness; NOT the market scan frequency)
-LOOP_TICK_SECONDS = 1
+# Scan cadence
+SLEEP_TARGET_SECONDS = 1  # loop tick (Binance calls are candle-close driven)
 
-# Market scan policy
-# We only evaluate signals on the LAST CLOSED 15m candle. Scanning faster than 15m won't add value.
-SCAN_ON_NEW_15M_CLOSE = True
-SCAN_FALLBACK_SECONDS = 60  # if SCAN_ON_NEW_15M_CLOSE=False, evaluate every N seconds
-
+ 
+# Binance request hygiene (prevents 418/429 bans)
+MIN_BINANCE_INTERVAL = 0.35  # seconds between ANY Binance REST calls
+BAN_BACKOFF_DEFAULT = 60     # seconds to sleep on 418/429 if Retry-After missing
 # HTTP timeouts
 HTTP_TIMEOUT = 12
 TELEGRAM_POLL_TIMEOUT = 2  # long poll
@@ -63,6 +62,11 @@ TG_CONFLICT_BACKOFF = 30
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "momentum-entrywatch/1.0"})
+
+# Global throttling state (simple & effective)
+_BINANCE_LAST_CALL_TS = 0.0
+_BINANCE_BAN_UNTIL = 0.0
+
 
 # ============================================================
 # Helpers: time / formatting
@@ -112,8 +116,35 @@ def next_15m_close_eta() -> tuple[str, float]:
 # Binance Futures public REST
 # ============================================================
 def http_get(path: str, params: dict) -> dict | list:
+    """
+    Binance REST with basic global throttling + sane backoff.
+    Prevents IP bans (418) when running bots on small hosts.
+    """
+    global _BINANCE_LAST_CALL_TS, _BINANCE_BAN_UNTIL
+
+    now = time.time()
+    # If we are currently banned/backing off, wait (but do NOT busy-loop)
+    if now < _BINANCE_BAN_UNTIL:
+        time.sleep(max(0.0, _BINANCE_BAN_UNTIL - now))
+        now = time.time()
+
+    # Global minimum spacing between calls (across all endpoints/symbols)
+    wait = MIN_BINANCE_INTERVAL - (now - _BINANCE_LAST_CALL_TS)
+    if wait > 0:
+        time.sleep(wait)
+
     url = BINANCE_FAPI + path
     r = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
+    _BINANCE_LAST_CALL_TS = time.time()
+
+    # Handle rate-limit / bans gracefully
+    if r.status_code in (418, 429):
+        retry_after = r.headers.get("Retry-After")
+        backoff = int(retry_after) if (retry_after and str(retry_after).isdigit()) else BAN_BACKOFF_DEFAULT
+        # set ban window and raise to main loop
+        _BINANCE_BAN_UNTIL = time.time() + max(5, backoff)
+        raise requests.HTTPError(f"{r.status_code} rate-limited/banned (backoff {backoff}s)", response=r)
+
     r.raise_for_status()
     return r.json()
 
@@ -211,10 +242,18 @@ class MarketCache:
     def __init__(self):
         self.data = {s: {"15m": TFCached(), "1h": TFCached(), "4h": TFCached()} for s in SYMBOLS}
 
-    def refresh_15m(self, symbol: str):
+    def refresh_15m_force(self, symbol: str):
+        """Force refresh 15m data (used for manual /report)."""
         df = fetch_klines_df(symbol, "15m", OHLCV_LIMIT_15M)
         df = add_indicators_15m(df)
         self.data[symbol]["15m"] = TFCached(df=df, last_closed_open_ms=last_closed_open_ms("15m"))
+
+    def refresh_15m_if_needed(self, symbol: str):
+        """Refresh 15m ONLY when a new 15m candle has CLOSED."""
+        expected = last_closed_open_ms("15m")
+        cached = self.data[symbol]["15m"]
+        if cached.df is None or cached.last_closed_open_ms != expected:
+            self.refresh_15m_force(symbol)
 
     def refresh_htf_if_needed(self, symbol: str, tf: str):
         expected = last_closed_open_ms(tf)
@@ -557,7 +596,7 @@ def build_manual_report(symbol: str | "MarketCache", cache: "MarketCache" | str 
     if not isinstance(cache, MarketCache):
         raise TypeError("build_manual_report() expected (symbol, cache)")
 
-    cache.refresh_15m(symbol)
+    cache.refresh_15m_force(symbol)
     cache.ensure_context_ready(symbol)
 
     df15 = cache.get(symbol, "15m")
@@ -589,7 +628,7 @@ def build_report_message(symbols: list[str], cache: "MarketCache") -> str:
     blocks = []
     data_blocks = []
     for s in symbols:
-        cache.refresh_15m(s)
+        cache.refresh_15m_force(s)
         cache.ensure_context_ready(s)
 
         df15 = cache.get(s, "15m")
@@ -673,17 +712,12 @@ def main():
             "✅ BOT ONLINE\n"
             f"UTC: {utc_now_str()}\n"
             f"Mode: 15m close-based ENTRY_WATCH\n"
-            f"Loop tick: ~{LOOP_TICK_SECONDS}s\n"
+            f"Loop tick: ~{SLEEP_TARGET_SECONDS}s (Binance fetch on 15m close)\n"
             f"Symbols: {', '.join(SYMBOLS)}\n"
             "Commands: /report \n/report BTCUSDT \n/status"
         )
 
     offset = None
-
-    # Scan scheduling state
-    last_scan_fallback_ts = 0.0
-    health["last_scan_candle_open_ms"] = None
-
 
     while True:
         loop_start = time.time()
@@ -721,70 +755,56 @@ def main():
                         last_scan = health["last_scan_utc"] or "N/A"
                         last_sig = health["last_signal_utc"] or "N/A"
                         last_sig_text = health["last_signal_text"] or "None yet"
-                        next_close_utc, eta_sec = next_15m_close_eta()
-                        scan_mode = "15m-close" if SCAN_ON_NEW_15M_CLOSE else f"every {SCAN_FALLBACK_SECONDS}s"
                         tg_send_message(
                             "📡 STATUS\n"
                             f"UTC now: {utc_now_str()}\n"
+                            f"Next 15m close: {next_15m_close_eta()[0]} (ETA {int(next_15m_close_eta()[1])}s)\n"
                             f"Uptime: {uptime_min} min\n"
-                            f"Loop tick: ~{LOOP_TICK_SECONDS}s\n"
-                            f"Scan mode: {scan_mode}\n"
+                            f"Loop tick: ~{SLEEP_TARGET_SECONDS}s (Binance fetch on 15m close)\n"
                             f"Scans: {health['scan_count']}\n"
                             f"Last scan: {last_scan}\n"
-                            f"Next 15m close: {next_close_utc} (ETA {int(eta_sec)}s)\n"
                             f"Last signal: {last_sig}\n"
                             f"Last signal detail: {last_sig_text}"
                         )
-            # 2) Scan for entry triggers (15m candle-close driven)
-            do_scan = False
-            if SCAN_ON_NEW_15M_CLOSE:
-                expected_open_ms = last_closed_open_ms("15m")
-                if health.get("last_scan_candle_open_ms") != expected_open_ms:
-                    do_scan = True
-                    health["last_scan_candle_open_ms"] = expected_open_ms
-            else:
-                now_ts = time.time()
-                if now_ts - last_scan_fallback_ts >= SCAN_FALLBACK_SECONDS:
-                    do_scan = True
-                    last_scan_fallback_ts = now_ts
 
-            if do_scan:
-                for symbol in SYMBOLS:
-                    cache.refresh_15m(symbol)
-                    cache.ensure_context_ready(symbol)
+            # 2) Scan for entry triggers
+            for symbol in SYMBOLS:
+                cache.refresh_15m_if_needed(symbol)
+                cache.ensure_context_ready(symbol)
 
-                    df15 = cache.get(symbol, "15m")
-                    df1h = cache.get(symbol, "1h")
-                    df4h = cache.get(symbol, "4h")
+                df15 = cache.get(symbol, "15m")
+                df1h = cache.get(symbol, "1h")
+                df4h = cache.get(symbol, "4h")
 
-                    trig = check_entry_trigger(symbol, df15, df1h, df4h)
-                    if trig is None:
-                        continue
+                trig = check_entry_trigger(symbol, df15, df1h, df4h)
+                if trig is None:
+                    continue
 
-                    # de-dup per symbol per closed candle + direction
-                    if last_signal[symbol]["candle_ts"] == trig["candle_ts"] and last_signal[symbol]["direction"] == trig["direction"]:
-                        continue
+                # de-dup per symbol per closed candle + direction
+                if last_signal[symbol]["candle_ts"] == trig["candle_ts"] and last_signal[symbol]["direction"] == trig["direction"]:
+                    continue
 
-                    i15 = trig["i"]
-                    report = build_snapshot_report(
-                        symbol=symbol,
-                        tag="ENTRY_WATCH (15m close trigger)",
-                        direction=trig["direction"],
-                        vol_ratio=trig["vol_ratio"],
-                        df15=df15,
-                        df1h=df1h,
-                        df4h=df4h,
-                        i15=i15
-                    )
-                    tg_send_message(report)
+                i15 = trig["i"]
+                report = build_snapshot_report(
+                    symbol=symbol,
+                    tag="ENTRY_WATCH (15m close trigger)",
+                    direction=trig["direction"],
+                    vol_ratio=trig["vol_ratio"],
+                    df15=df15,
+                    df1h=df1h,
+                    df4h=df4h,
+                    i15=i15
+                )
+                tg_send_message(report)
 
-                    last_signal[symbol]["candle_ts"] = trig["candle_ts"]
-                    last_signal[symbol]["direction"] = trig["direction"]
-                    health["last_signal_utc"] = utc_now_str()
-                    health["last_signal_text"] = f"{symbol} {trig['direction']} @ candle {utc_ts(trig['candle_ts'])}"
+                last_signal[symbol]["candle_ts"] = trig["candle_ts"]
+                last_signal[symbol]["direction"] = trig["direction"]
+                health["last_signal_utc"] = utc_now_str()
+                health["last_signal_text"] = f"{symbol} {trig['direction']} @ candle {utc_ts(trig['candle_ts'])}"
 
-                health["last_scan_utc"] = utc_now_str()
-                health["scan_count"] += 1
+            health["last_scan_utc"] = utc_now_str()
+            health["scan_count"] += 1
+
             # 3) Heartbeat
             if HEARTBEAT_MINUTES and HEARTBEAT_MINUTES > 0:
                 now = time.time()
@@ -815,7 +835,7 @@ def main():
 
         # 4) Keep ~fixed cadence
         elapsed = time.time() - loop_start
-        time.sleep(max(0.2, (LOOP_TICK_SECONDS - elapsed)))
+        time.sleep(max(1, int(SLEEP_TARGET_SECONDS - elapsed)))
 
 if __name__ == "__main__":
     main()
