@@ -138,10 +138,18 @@ def tg_send_message(text: str):
 # =========================
 def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # ✅ VWAP in pandas_ta needs an ORDERED DatetimeIndex
+    out["dt"] = pd.to_datetime(out["ts"], unit="ms", utc=True)
+    out = out.sort_values("dt").set_index("dt")
+
     out["ema20"] = ta.ema(out["close"], length=20)
     out["ema50"] = ta.ema(out["close"], length=50)
     out["ema200"] = ta.ema(out["close"], length=200)
+
+    # VWAP (now valid)
     out["vwap"] = ta.vwap(out["high"], out["low"], out["close"], out["volume"])
+
     out["rsi14"] = ta.rsi(out["close"], length=14)
 
     macd = ta.macd(out["close"], fast=12, slow=26, signal=9)
@@ -156,7 +164,11 @@ def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
 
     out["atr14"] = ta.atr(out["high"], out["low"], out["close"], length=14)
     out["vol_sma20"] = out["volume"].rolling(20).mean()
+
+    # return to normal index
+    out = out.reset_index(drop=True)
     return out
+
 
 
 def add_ema_pack(df: pd.DataFrame) -> pd.DataFrame:
@@ -386,6 +398,12 @@ def parse_report_command(text: str) -> list[str] | None:
 # Main
 # =========================
 def main():
+    tg_send_message(
+    "🤖 Momentum Scanner ONLINE\n"
+    f"UTC: {utc_now_str()}\n"
+    "Mode: Realtime momentum (forming candle)\n"
+    "Scan: ~60s\n"
+)
     cache = MarketCache()
 
     # State per symbol for anti-spam
