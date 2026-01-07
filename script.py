@@ -436,8 +436,7 @@ def _build_snapshot_report_full(symbol: str, tag: str, direction: str, vol_ratio
 
     # Diagnostics (LONG/SHORT readiness)
     diag = summarize_trigger_state(df15, df1h, df4h, i15)
-    return "
-".join(msg)
+    return "\n".join(msg)
 
 # ============================================================
 # Snapshot report wrapper (supports both old and new call styles)
