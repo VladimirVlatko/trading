@@ -136,19 +136,13 @@ def tg_api(method: str) -> str:
 
 
 def tg_get_updates(offset: int | None) -> dict:
-    """
-    IMPORTANT:
-    - Telegram allows only one getUpdates long-poller at a time per bot token.
-    - If another poller exists, Telegram returns HTTP 409.
-    We handle 409 gracefully so the bot continues scanning & sending alerts.
-    """
     params = {"timeout": TELEGRAM_POLL_TIMEOUT}
     if offset is not None:
         params["offset"] = offset
 
     r = SESSION.get(tg_api("getUpdates"), params=params, timeout=TELEGRAM_POLL_TIMEOUT + 10)
 
-    # ✅ Handle 409 conflict gracefully (no exception, no spam)
+    # 409 = another poller existed briefly (deploy overlap). Don't treat as error.
     if r.status_code == 409:
         return {"ok": False, "conflict": True, "result": []}
 
@@ -486,7 +480,8 @@ def main():
 
             # ✅ If conflict, don't error-spam; just backoff and keep scanning
             if isinstance(upd, dict) and upd.get("conflict"):
-                time.sleep(TG_CONFLICT_BACKOFF)
+                # skip command handling this loop
+                upd = {"ok": False, "result": []}
 
             if isinstance(upd, dict) and upd.get("ok") and upd.get("result"):
                 for u in upd["result"]:
