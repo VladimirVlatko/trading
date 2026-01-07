@@ -26,11 +26,11 @@ BINANCE_FAPI = "https://fapi.binance.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 # Scan cadence
-SLEEP_TARGET_SECONDS = 60
+SLEEP_TARGET_SECONDS = 10
 
 # HTTP timeouts
 HTTP_TIMEOUT = 12
-TELEGRAM_POLL_TIMEOUT = 10  # long poll
+TELEGRAM_POLL_TIMEOUT = 2  # long poll
 
 # Candle limits
 OHLCV_LIMIT_15M = 220
