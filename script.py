@@ -30,7 +30,7 @@ SLEEP_TARGET_SECONDS = 60
 
 # HTTP timeouts
 HTTP_TIMEOUT = 12
-TELEGRAM_POLL_TIMEOUT = 55  # long poll
+TELEGRAM_POLL_TIMEOUT = 10  # long poll
 
 # Candle limits
 OHLCV_LIMIT_15M = 220
@@ -480,7 +480,7 @@ def main():
 
             # ✅ If conflict, don't error-spam; just backoff and keep scanning
             if isinstance(upd, dict) and upd.get("conflict"):
-                # skip command handling this loop
+                time.sleep(5)
                 upd = {"ok": False, "result": []}
 
             if isinstance(upd, dict) and upd.get("ok") and upd.get("result"):
