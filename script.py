@@ -558,7 +558,7 @@ def main():
                         if arg is None:
                             reports = []
                             for s in SYMBOLS:
-                                reports.append(build_manual_report(s, cache))
+                                reports.append(build_snapshot_report(s, cache))
                             combined = "\n\n" + ("—" * 18) + "\n\n"
                             tg_send_message(combined.join(reports))
                         else:
