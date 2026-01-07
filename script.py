@@ -1,9 +1,12 @@
 from __future__ import annotations
+
 import os
+from typing import Optional, Union, Tuple, Dict, Any, List
 import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
 import requests
 import pandas as pd
 import pandas_ta as ta
@@ -22,27 +25,34 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BINANCE_FAPI = "https://fapi.binance.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-# Scan cadence
-SLEEP_TARGET_SECONDS = 1  # loop tick (Binance calls are candle-close driven)
+# Loop tick: keeps Telegram responsive. Binance calls are candle-close driven.
+SLEEP_TARGET_SECONDS = 1
 
- 
 # Binance request hygiene (prevents 418/429 bans)
 MIN_BINANCE_INTERVAL = 0.35  # seconds between ANY Binance REST calls
 BAN_BACKOFF_DEFAULT = 60     # seconds to sleep on 418/429 if Retry-After missing
+
 # HTTP timeouts
 HTTP_TIMEOUT = 12
 TELEGRAM_POLL_TIMEOUT = 2  # long poll
 
 # Candle limits
+OHLCV_LIMIT_5M = 220
 OHLCV_LIMIT_15M = 220
 OHLCV_LIMIT_HTF = 260
 
-# Trigger parameters
+# Trigger parameters (15m main trigger)
 VOL_SPIKE_MULT = 1.5
 RSI_MIN, RSI_MAX = 25, 75
 
 # MACD slope threshold (ATR scaled): require macdh slope magnitude >= ATR * this factor
 MACD_SLOPE_ATR_FACTOR = 0.03  # 0.03 * ATR (tune 0.02–0.06)
+
+# 5m early layer (WATCH / ENTRY_OK), only on 5m candle close
+WATCH_VOLX_5M = 1.15
+ENTRY_VOLX_5M = 1.30
+MACD_SLOPE_ATR_FACTOR_5M = 0.02
+NEAR_READY_DIST_ATR_15M = 0.80  # how close (in 15m ATR) price must be to 15m EMA20 to start 5m monitoring
 
 # Telegram max length (single message)
 MAX_TG_LEN = 3500
@@ -61,9 +71,9 @@ HEARTBEAT_TEXT = "🫀 HEARTBEAT (bot alive)"
 TG_CONFLICT_BACKOFF = 30
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "momentum-entrywatch/1.0"})
+SESSION.headers.update({"User-Agent": "momentum-entrywatch/1.1"})
 
-# Global throttling state (simple & effective)
+# Global throttling state
 _BINANCE_LAST_CALL_TS = 0.0
 _BINANCE_BAN_UNTIL = 0.0
 
@@ -78,7 +88,7 @@ def utc_ts(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def interval_seconds(tf: str) -> int:
-    return {"15m": 900, "1h": 3600, "4h": 14400}[tf]
+    return {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}[tf]
 
 def floor_to_interval_ms(epoch_ms: int, tf: str) -> int:
     sec = interval_seconds(tf)
@@ -88,6 +98,17 @@ def last_closed_open_ms(tf: str) -> int:
     now_ms = int(time.time() * 1000)
     curr_open = floor_to_interval_ms(now_ms, tf)
     return curr_open - interval_seconds(tf) * 1000
+
+def next_close_eta(tf: str) -> Tuple[str, float]:
+    now_ms = int(time.time() * 1000)
+    next_close_ms = floor_to_interval_ms(now_ms, tf) + interval_seconds(tf) * 1000
+    return utc_ts(next_close_ms), max(0.0, (next_close_ms - now_ms) / 1000.0)
+
+def next_15m_close_eta() -> Tuple[str, float]:
+    return next_close_eta("15m")
+
+def next_5m_close_eta() -> Tuple[str, float]:
+    return next_close_eta("5m")
 
 def safe_float(x, default=None):
     try:
@@ -106,16 +127,18 @@ def pct(a: float, b: float, default=float("nan")) -> float:
         return default
     return (a - b) / b * 100.0
 
-def next_15m_close_eta() -> tuple[str, float]:
-    """Return (next_close_utc_str, seconds_to_next_close)."""
-    now_ms = int(time.time() * 1000)
-    next_close_ms = floor_to_interval_ms(now_ms, "15m") + interval_seconds("15m") * 1000
-    return utc_ts(next_close_ms), max(0.0, (next_close_ms - now_ms) / 1000.0)
+def dist_atr(px: float, level: float, atr: float) -> float:
+    if px is None or level is None or atr is None:
+        return float("nan")
+    if not (atr == atr) or atr <= 0:
+        return float("nan")
+    return abs(px - level) / atr
+
 
 # ============================================================
 # Binance Futures public REST
 # ============================================================
-def http_get(path: str, params: dict) -> dict | list:
+def http_get(path: str, params: Dict[str, Any]) -> Union[Dict[str, Any], List[Any]]:
     """
     Binance REST with basic global throttling + sane backoff.
     Prevents IP bans (418) when running bots on small hosts.
@@ -123,7 +146,7 @@ def http_get(path: str, params: dict) -> dict | list:
     global _BINANCE_LAST_CALL_TS, _BINANCE_BAN_UNTIL
 
     now = time.time()
-    # If we are currently banned/backing off, wait (but do NOT busy-loop)
+    # If currently banned/backing off, wait (but do NOT busy-loop)
     if now < _BINANCE_BAN_UNTIL:
         time.sleep(max(0.0, _BINANCE_BAN_UNTIL - now))
         now = time.time()
@@ -141,8 +164,7 @@ def http_get(path: str, params: dict) -> dict | list:
     if r.status_code in (418, 429):
         retry_after = r.headers.get("Retry-After")
         backoff = int(retry_after) if (retry_after and str(retry_after).isdigit()) else BAN_BACKOFF_DEFAULT
-        # set ban window and raise to main loop
-        _BINANCE_BAN_UNTIL = time.time() + max(5, backoff)
+        _BINANCE_BAN_UNTIL = time.time() + max(10, backoff)
         raise requests.HTTPError(f"{r.status_code} rate-limited/banned (backoff {backoff}s)", response=r)
 
     r.raise_for_status()
@@ -160,9 +182,10 @@ def fetch_klines_df(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("int64")
     return df
 
-def fetch_mark_price(symbol: str) -> float | None:
+def fetch_mark_price(symbol: str) -> Optional[float]:
     j = http_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     return safe_float(j.get("markPrice"))
+
 
 # ============================================================
 # Telegram (polling)
@@ -170,7 +193,7 @@ def fetch_mark_price(symbol: str) -> float | None:
 def tg_api(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
-def tg_get_updates(offset: int | None) -> dict:
+def tg_get_updates(offset: Optional[int]) -> dict:
     params = {"timeout": TELEGRAM_POLL_TIMEOUT}
     if offset is not None:
         params["offset"] = offset
@@ -188,12 +211,12 @@ def tg_send_message(text: str):
     r = SESSION.post(tg_api("sendMessage"), json=payload, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
+
 # ============================================================
 # Indicators
 # ============================================================
-def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
+def _add_indicators_core(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # VWAP in pandas_ta requires ordered DatetimeIndex
     out["dt"] = pd.to_datetime(out["ts"], unit="ms", utc=True)
     out = out.sort_values("dt").set_index("dt")
 
@@ -216,12 +239,18 @@ def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
     out["atr14"] = ta.atr(out["high"], out["low"], out["close"], length=14)
     out["vol_sma20"] = out["volume"].rolling(20).mean()
 
-    # Useful "delta proxy": taker buy vs sell (base volume)
+    # Delta proxy: taker buy vs sell (base volume)
     out["taker_buy"] = out["taker_buy_base"]
     out["taker_sell"] = out["volume"] - out["taker_buy"]
 
     out = out.reset_index(drop=True)
     return out
+
+def add_indicators_15m(df: pd.DataFrame) -> pd.DataFrame:
+    return _add_indicators_core(df)
+
+def add_indicators_5m(df: pd.DataFrame) -> pd.DataFrame:
+    return _add_indicators_core(df)
 
 def add_ema_pack(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -230,31 +259,47 @@ def add_ema_pack(df: pd.DataFrame) -> pd.DataFrame:
     out["ema200"] = ta.ema(out["close"], length=200)
     return out
 
+
 # ============================================================
-# Cache (HTF refresh only when new candle closes)
+# Cache (refresh only when new candle closes)
 # ============================================================
 @dataclass
 class TFCached:
-    df: pd.DataFrame | None = None
+    df: Optional[pd.DataFrame] = None
     last_closed_open_ms: int | None = None
 
 class MarketCache:
     def __init__(self):
-        self.data = {s: {"15m": TFCached(), "1h": TFCached(), "4h": TFCached()} for s in SYMBOLS}
+        self.data = {
+            s: {"5m": TFCached(), "15m": TFCached(), "1h": TFCached(), "4h": TFCached()}
+            for s in SYMBOLS
+        }
 
+    # ---- 15m (main) ----
     def refresh_15m_force(self, symbol: str):
-        """Force refresh 15m data (used for manual /report)."""
         df = fetch_klines_df(symbol, "15m", OHLCV_LIMIT_15M)
         df = add_indicators_15m(df)
         self.data[symbol]["15m"] = TFCached(df=df, last_closed_open_ms=last_closed_open_ms("15m"))
 
     def refresh_15m_if_needed(self, symbol: str):
-        """Refresh 15m ONLY when a new 15m candle has CLOSED."""
         expected = last_closed_open_ms("15m")
         cached = self.data[symbol]["15m"]
         if cached.df is None or cached.last_closed_open_ms != expected:
             self.refresh_15m_force(symbol)
 
+    # ---- 5m (early layer) ----
+    def refresh_5m_force(self, symbol: str):
+        df = fetch_klines_df(symbol, "5m", OHLCV_LIMIT_5M)
+        df = add_indicators_5m(df)
+        self.data[symbol]["5m"] = TFCached(df=df, last_closed_open_ms=last_closed_open_ms("5m"))
+
+    def refresh_5m_if_needed(self, symbol: str):
+        expected = last_closed_open_ms("5m")
+        cached = self.data[symbol]["5m"]
+        if cached.df is None or cached.last_closed_open_ms != expected:
+            self.refresh_5m_force(symbol)
+
+    # ---- HTF ----
     def refresh_htf_if_needed(self, symbol: str, tf: str):
         expected = last_closed_open_ms(tf)
         cached = self.data[symbol][tf]
@@ -273,10 +318,11 @@ class MarketCache:
             raise RuntimeError(f"Cache missing for {symbol} {tf}")
         return df
 
+
 # ============================================================
 # Entry trigger (15m LAST CLOSED, cross-based, HTF-filtered)
 # ============================================================
-def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> dict | None:
+def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     i = len(df15) - 2
     p = i - 1
     if i < 210:
@@ -286,7 +332,6 @@ def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4
     if not all(c in df15.columns for c in needed):
         return None
 
-    # NaN guards (both current and previous where needed)
     for c in needed:
         if pd.isna(df15.loc[i, c]):
             return None
@@ -344,14 +389,132 @@ def check_entry_trigger(symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame, df4
         return {"symbol": symbol, "direction": "SHORT", "vol_ratio": vol_ratio, "i": i, "candle_ts": candle_ts}
     return None
 
+
 # ============================================================
-# Diagnostics for reports (used by both manual and alerts)
+# 5m Early layer: near-ready + WATCH / ENTRY_OK
+# ============================================================
+def _htf_ctx(df1h: pd.DataFrame, df4h: pd.DataFrame) -> Tuple[bool, bool, str, str]:
+    i1h, i4h = len(df1h) - 2, len(df4h) - 2
+    c1h, e1h = safe_float(df1h.loc[i1h, "close"]), safe_float(df1h.loc[i1h, "ema200"])
+    c4h, e4h = safe_float(df4h.loc[i4h, "close"]), safe_float(df4h.loc[i4h, "ema200"])
+    htf_long_ok = (c1h is not None and e1h is not None and c4h is not None and e4h is not None and (c1h > e1h) and (c4h > e4h))
+    htf_short_ok = (c1h is not None and e1h is not None and c4h is not None and e4h is not None and (c1h < e1h) and (c4h < e4h))
+    ctx_1h = "ABOVE" if (c1h is not None and e1h is not None and c1h > e1h) else "BELOW"
+    ctx_4h = "ABOVE" if (c4h is not None and e4h is not None and c4h > e4h) else "BELOW"
+    return htf_long_ok, htf_short_ok, ctx_1h, ctx_4h
+
+def evaluate_5m_hint(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Runs on LAST CLOSED 5m candle.
+    Uses 15m/HTF as context, but attempts to catch momentum while the current 15m is building.
+    """
+    i5 = len(df5) - 2
+    if i5 < 60:
+        return None
+    i15 = len(df15) - 2
+    if i15 < 210:
+        return None
+
+    # Guard required cols
+    need5 = ["close", "ema20", "rsi14", "volume", "vol_sma20", "macdh", "atr14"]
+    need15 = ["ema20", "ema50", "vwap", "atr14", "ema200"]
+    if not all(c in df5.columns for c in need5) or not all(c in df15.columns for c in need15):
+        return None
+    if any(pd.isna(df5.loc[i5, c]) for c in need5) or any(pd.isna(df15.loc[i15, c]) for c in need15):
+        return None
+
+    # HTF
+    htf_long_ok, htf_short_ok, ctx_1h, ctx_4h = _htf_ctx(df1h, df4h)
+
+    # Price proxy: last closed 5m close (keeps us from calling markPrice too often)
+    px = float(df5.loc[i5, "close"])
+
+    # 15m context levels (last closed 15m)
+    ema20_15 = float(df15.loc[i15, "ema20"])
+    ema50_15 = float(df15.loc[i15, "ema50"])
+    vwap_15 = float(df15.loc[i15, "vwap"])
+    atr15 = float(df15.loc[i15, "atr14"])
+
+    bias_longish = (px > vwap_15) and (ema20_15 > ema50_15)
+    bias_shortish = (px < vwap_15) and (ema20_15 < ema50_15)
+
+    zone = dist_atr(px, ema20_15, atr15)
+    near_zone = (zone == zone) and (zone <= NEAR_READY_DIST_ATR_15M)
+
+    near_ready_long = htf_long_ok and near_zone and (bias_longish or (px > ema20_15))
+    near_ready_short = htf_short_ok and near_zone and (bias_shortish or (px < ema20_15))
+
+    if not (near_ready_long or near_ready_short):
+        return None
+
+    # 5m momentum metrics (last closed)
+    vol = float(df5.loc[i5, "volume"])
+    vol_avg = float(df5.loc[i5, "vol_sma20"])
+    volx = (vol / vol_avg) if vol_avg > 0 else float("nan")
+    rsi = float(df5.loc[i5, "rsi14"])
+    atr5 = float(df5.loc[i5, "atr14"])
+    macdh = float(df5.loc[i5, "macdh"])
+    macdh_prev = safe_float(df5.loc[i5 - 1, "macdh"], default=float("nan"))
+    macd_slope = macdh - macdh_prev if (macdh_prev == macdh_prev) else float("nan")
+    slope_thr = max(1e-12, atr5 * MACD_SLOPE_ATR_FACTOR_5M)
+
+    ema20_5 = float(df5.loc[i5, "ema20"])
+    candle_ts = int(df5.loc[i5, "ts"])
+    candle_utc = utc_ts(candle_ts + interval_seconds("5m") * 1000)
+
+    def pack(state: str, direction: str, why: str) -> dict:
+        return {
+            "symbol": symbol,
+            "state": state,
+            "direction": direction,
+            "utc": candle_utc,
+            "candle_ts": candle_ts,
+            "px": px,
+            "volx": volx,
+            "rsi": rsi,
+            "macd_slope": macd_slope,
+            "slope_thr": slope_thr,
+            "zone_atr15": zone,
+            "ctx_1h": ctx_1h,
+            "ctx_4h": ctx_4h,
+            "why": why,
+        }
+
+    # Long side
+    if near_ready_long:
+        watch_ok = (volx == volx and volx >= WATCH_VOLX_5M) and (rsi >= 35) and (macd_slope == macd_slope and macd_slope > +slope_thr)
+        entry_ok = watch_ok and (volx >= ENTRY_VOLX_5M) and (px > ema20_5)
+        if entry_ok:
+            return pack("ENTRY_OK", "LONG", "near_ready + 5m momentum confirmed")
+        if watch_ok:
+            return pack("SETUP_WATCH", "LONG", "near_ready + 5m momentum building")
+
+    # Short side
+    if near_ready_short:
+        watch_ok = (volx == volx and volx >= WATCH_VOLX_5M) and (rsi <= 65) and (macd_slope == macd_slope and macd_slope < -slope_thr)
+        entry_ok = watch_ok and (volx >= ENTRY_VOLX_5M) and (px < ema20_5)
+        if entry_ok:
+            return pack("ENTRY_OK", "SHORT", "near_ready + 5m momentum confirmed")
+        if watch_ok:
+            return pack("SETUP_WATCH", "SHORT", "near_ready + 5m momentum building")
+
+    return None
+
+def render_5m_hint(h: Dict[str, Any]) -> str:
+    return (
+        f"👀 {h['symbol']} — {h['state']} | {h['direction']} | {h['utc']}\n"
+        f"HTF: 1h {h['ctx_1h']} | 4h {h['ctx_4h']} | zone15m={h['zone_atr15']:.2f}ATR\n"
+        f"5m: p {h['px']:.2f} | VOLx {h['volx']:.2f} | RSI {h['rsi']:.1f} | "
+        f"MACD_slope {h['macd_slope']:.4f} (thr {h['slope_thr']:.4f})\n"
+        f"Why: {h['why']}"
+    )
+
+
+# ============================================================
+# Diagnostics for reports (used by manual reports and alerts)
 # ============================================================
 def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, i: int) -> dict:
-    """Return a dict with LONG/SHORT trigger readiness and missing components."""
     p = i - 1
-
-    # HTF context
     i1h, i4h = len(df1h) - 2, len(df4h) - 2
     c1h, e1h = safe_float(df1h.loc[i1h, "close"]), safe_float(df1h.loc[i1h, "ema200"])
     c4h, e4h = safe_float(df4h.loc[i4h, "close"]), safe_float(df4h.loc[i4h, "ema200"])
@@ -360,7 +523,6 @@ def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.Dat
     htf_short_ok = (c1h is not None and e1h is not None and c4h is not None and e4h is not None
                     and (c1h < e1h) and (c4h < e4h))
 
-    # 15m values and crosses
     close_prev, close_curr = safe_float(df15.loc[p, "close"]), safe_float(df15.loc[i, "close"])
     vwap_prev, vwap_curr = safe_float(df15.loc[p, "vwap"]), safe_float(df15.loc[i, "vwap"])
     e20_prev, e20_curr = safe_float(df15.loc[p, "ema20"]), safe_float(df15.loc[i, "ema20"])
@@ -375,14 +537,12 @@ def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.Dat
     ema_cross_dn = (e20_prev is not None and e50_prev is not None and e20_curr is not None and e50_curr is not None
                     and (e20_prev >= e50_prev) and (e20_curr < e50_curr))
 
-    # Volume & RSI
     vol = safe_float(df15.loc[i, "volume"])
     vol_avg = safe_float(df15.loc[i, "vol_sma20"], default=0.0)
     vol_ratio = (vol / vol_avg) if (vol_avg and vol_avg > 0) else float("nan")
     rsi = safe_float(df15.loc[i, "rsi14"])
     rsi_ok = (rsi is not None and (RSI_MIN < rsi < RSI_MAX))
 
-    # MACD slope vs ATR threshold
     mh_curr = safe_float(df15.loc[i, "macdh"])
     mh_prev = safe_float(df15.loc[p, "macdh"])
     atr = safe_float(df15.loc[i, "atr14"], default=0.0)
@@ -391,7 +551,6 @@ def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.Dat
     macd_up_ok = (macd_slope == macd_slope) and (macd_slope > +slope_thr)
     macd_dn_ok = (macd_slope == macd_slope) and (macd_slope < -slope_thr)
 
-    # LONG/SHORT readiness and missing
     missing_long = []
     if not htf_long_ok:         missing_long.append("HTF_LONG")
     if not vwap_cross_up:       missing_long.append("VWAP_CROSS_UP")
@@ -430,10 +589,11 @@ def summarize_trigger_state(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.Dat
         "missing_short": missing_short,
     }
 
+
 # ============================================================
-# Report building
+# Report building (single-message, compacting automatically)
 # ============================================================
-def _fmt(v: float | None, digits: int = 2) -> str:
+def _fmt(v: Optional[float], digits: int = 2) -> str:
     if v is None or not (v == v):
         return "NA"
     return f"{v:.{digits}f}"
@@ -504,7 +664,7 @@ def _snapshot_report_data(symbol: str, tag: str, direction: str, vol_ratio: floa
         "diag": diag,
     }
 
-def _render_snapshot_block(data: dict, compact_level: int = 0) -> str:
+def _render_snapshot_block(data: Dict[str, Any], compact_level: int = 0) -> str:
     diag = data["diag"]
     lines = [
         f"🧭 {data['symbol']} | {data['direction']} | {data['utc']}",
@@ -522,9 +682,7 @@ def _render_snapshot_block(data: dict, compact_level: int = 0) -> str:
             f"(thr {_fmt(data['slope_thr'], 4)})"
         )
     else:
-        lines.append(
-            f"MACD slope {_fmt(data['macd_slope'], 4)} (thr {_fmt(data['slope_thr'], 4)})"
-        )
+        lines.append(f"MACD slope {_fmt(data['macd_slope'], 4)} (thr {_fmt(data['slope_thr'], 4)})")
 
     if compact_level < 2:
         lines.append(
@@ -532,9 +690,7 @@ def _render_snapshot_block(data: dict, compact_level: int = 0) -> str:
             f"EMA200 {_fmt(data['dist_close_e200'])}"
         )
     else:
-        lines.append(
-            f"Dist %: VWAP {_fmt(data['dist_close_vwap'])} | EMA200 {_fmt(data['dist_close_e200'])}"
-        )
+        lines.append(f"Dist %: VWAP {_fmt(data['dist_close_vwap'])} | EMA200 {_fmt(data['dist_close_e200'])}")
 
     if compact_level < 1:
         lines.append(
@@ -555,30 +711,16 @@ def _render_snapshot_block(data: dict, compact_level: int = 0) -> str:
 
     return "\n".join(lines)
 
-def _build_snapshot_report_full(symbol: str, tag: str, direction: str, vol_ratio: float,
-                          df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, i15: int) -> str:
-    data = _snapshot_report_data(symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15)
-    return _render_snapshot_block(data, compact_level=0)
-
-# ============================================================
-# Snapshot report wrapper (supports both old and new call styles)
-# ============================================================
 def build_snapshot_report(*args, **kwargs) -> str:
-    """
-    Backwards/forwards compatible wrapper.
-
-    Supported call styles:
-    1) build_snapshot_report(symbol, cache)  -> returns MANUAL_REPORT snapshot (compact/full per _build_snapshot_report_full)
-    2) build_snapshot_report(symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15) -> full builder
-    """
     if kwargs:
         if "cache" in kwargs and "symbol" in kwargs:
             return build_manual_report(kwargs["symbol"], kwargs["cache"])
         if all(k in kwargs for k in ["symbol", "tag", "direction", "vol_ratio", "df15", "df1h", "df4h", "i15"]):
-            return _build_snapshot_report_full(
+            data = _snapshot_report_data(
                 kwargs["symbol"], kwargs["tag"], kwargs["direction"], kwargs["vol_ratio"],
                 kwargs["df15"], kwargs["df1h"], kwargs["df4h"], kwargs["i15"]
             )
+            return _render_snapshot_block(data, compact_level=0)
 
     if len(args) == 2:
         symbol, cache = args
@@ -586,11 +728,12 @@ def build_snapshot_report(*args, **kwargs) -> str:
 
     if len(args) >= 8:
         symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15 = args[:8]
-        return _build_snapshot_report_full(symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15)
+        data = _snapshot_report_data(symbol, tag, direction, vol_ratio, df15, df1h, df4h, i15)
+        return _render_snapshot_block(data, compact_level=0)
 
     raise TypeError("build_snapshot_report() expected (symbol, cache) or full 8-arg signature")
 
-def build_manual_report(symbol: str | "MarketCache", cache: "MarketCache" | str | None = None) -> str:
+def build_manual_report(symbol: Union[str, 'MarketCache'], cache: Optional[Union['MarketCache', str]] = None) -> str:
     if isinstance(symbol, MarketCache) and isinstance(cache, str):
         symbol, cache = cache, symbol
     if not isinstance(cache, MarketCache):
@@ -622,10 +765,10 @@ def build_manual_report(symbol: str | "MarketCache", cache: "MarketCache" | str 
         elif close < vwap and ema20 < ema50:
             direction = "SHORT-ish"
 
-    return _build_snapshot_report_full(symbol, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15)
+    data = _snapshot_report_data(symbol, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15)
+    return _render_snapshot_block(data, compact_level=0)
 
-def build_report_message(symbols: list[str], cache: "MarketCache") -> str:
-    blocks = []
+def build_report_message(symbols: List[str], cache: "MarketCache") -> str:
     data_blocks = []
     for s in symbols:
         cache.refresh_15m_force(s)
@@ -655,9 +798,7 @@ def build_report_message(symbols: list[str], cache: "MarketCache") -> str:
             elif close < vwap and ema20 < ema50:
                 direction = "SHORT-ish"
 
-        data_blocks.append(_snapshot_report_data(
-            s, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15
-        ))
+        data_blocks.append(_snapshot_report_data(s, "MANUAL_REPORT", direction, vol_ratio, df15, df1h, df4h, i15))
 
     def render(compact_level: int) -> str:
         rendered = []
@@ -680,6 +821,7 @@ def build_report_message(symbols: list[str], cache: "MarketCache") -> str:
 
     return message
 
+
 # ============================================================
 # Command parsing
 # ============================================================
@@ -691,18 +833,25 @@ def parse_command(text: str):
     arg = parts[1].upper().replace("/", "") if len(parts) > 1 else None
     return cmd, arg
 
+
 # ============================================================
 # Main loop
 # ============================================================
 def main():
     start_ts = time.time()
     cache = MarketCache()
+
+    # de-dup memory
     last_signal = {s: {"candle_ts": None, "direction": None} for s in SYMBOLS}
+    last_hint = {s: {"candle_ts": None, "state": None, "direction": None} for s in SYMBOLS}
+
     health = {
         "last_scan_utc": None,
         "last_signal_utc": None,
         "last_signal_text": None,
         "scan_count": 0,
+        "last_5m_utc": None,
+        "last_15m_utc": None,
     }
     last_error_notify = 0.0
     last_heartbeat = 0.0
@@ -711,10 +860,10 @@ def main():
         tg_send_message(
             "✅ BOT ONLINE\n"
             f"UTC: {utc_now_str()}\n"
-            f"Mode: 15m close-based ENTRY_WATCH\n"
-            f"Loop tick: ~{SLEEP_TARGET_SECONDS}s (Binance fetch on 15m close)\n"
+            "Mode: 15m close ENTRY trigger + 5m near-ready WATCH/ENTRY_OK\n"
+            f"Loop tick: ~{SLEEP_TARGET_SECONDS}s (Binance fetch on 5m/15m candle close)\n"
             f"Symbols: {', '.join(SYMBOLS)}\n"
-            "Commands: /report \n/report BTCUSDT \n/status"
+            "Commands: /report  | /report BTCUSDT | /status"
         )
 
     offset = None
@@ -724,9 +873,8 @@ def main():
         try:
             # 1) Telegram polling (commands)
             upd = tg_get_updates(offset)
-            # ✅ If conflict, don't error-spam; just backoff and keep scanning
             if isinstance(upd, dict) and upd.get("conflict"):
-                time.sleep(5)
+                time.sleep(TG_CONFLICT_BACKOFF)
                 upd = {"ok": False, "result": []}
 
             if isinstance(upd, dict) and upd.get("ok") and upd.get("result"):
@@ -755,52 +903,79 @@ def main():
                         last_scan = health["last_scan_utc"] or "N/A"
                         last_sig = health["last_signal_utc"] or "N/A"
                         last_sig_text = health["last_signal_text"] or "None yet"
+                        next5, eta5 = next_5m_close_eta()
+                        next15, eta15 = next_15m_close_eta()
                         tg_send_message(
                             "📡 STATUS\n"
                             f"UTC now: {utc_now_str()}\n"
-                            f"Next 15m close: {next_15m_close_eta()[0]} (ETA {int(next_15m_close_eta()[1])}s)\n"
+                            f"Next 5m close: {next5} (ETA {int(eta5)}s)\n"
+                            f"Next 15m close: {next15} (ETA {int(eta15)}s)\n"
                             f"Uptime: {uptime_min} min\n"
-                            f"Loop tick: ~{SLEEP_TARGET_SECONDS}s (Binance fetch on 15m close)\n"
-                            f"Scans: {health['scan_count']}\n"
+                            f"Loop tick: ~{SLEEP_TARGET_SECONDS}s (Binance fetch on 5m/15m close)\n"
+                            f"Ticks: {health['scan_count']}\n"
                             f"Last scan: {last_scan}\n"
+                            f"Last 5m refresh: {health['last_5m_utc'] or 'N/A'}\n"
+                            f"Last 15m refresh: {health['last_15m_utc'] or 'N/A'}\n"
                             f"Last signal: {last_sig}\n"
                             f"Last signal detail: {last_sig_text}"
                         )
 
-            # 2) Scan for entry triggers
+            # 2) Candle-close driven refresh + scanning
             for symbol in SYMBOLS:
-                cache.refresh_15m_if_needed(symbol)
+                # Ensure HTF always ready (cached; refreshes only on 1h/4h close)
                 cache.ensure_context_ready(symbol)
 
+                # 15m refresh only on 15m close
+                prev_15m_open = cache.data[symbol]["15m"].last_closed_open_ms
+                cache.refresh_15m_if_needed(symbol)
+                if cache.data[symbol]["15m"].last_closed_open_ms != prev_15m_open:
+                    health["last_15m_utc"] = utc_now_str()
+
+                # 5m refresh only on 5m close
+                prev_5m_open = cache.data[symbol]["5m"].last_closed_open_ms
+                cache.refresh_5m_if_needed(symbol)
+                if cache.data[symbol]["5m"].last_closed_open_ms != prev_5m_open:
+                    health["last_5m_utc"] = utc_now_str()
+
                 df15 = cache.get(symbol, "15m")
+                df5 = cache.get(symbol, "5m")
                 df1h = cache.get(symbol, "1h")
                 df4h = cache.get(symbol, "4h")
 
-                trig = check_entry_trigger(symbol, df15, df1h, df4h)
-                if trig is None:
-                    continue
+                # ---- 5m early hint (only react on new 5m candle close) ----
+                if cache.data[symbol]["5m"].last_closed_open_ms != prev_5m_open:
+                    hint = evaluate_5m_hint(symbol, df5, df15, df1h, df4h)
+                    if hint is not None:
+                        if (last_hint[symbol]["candle_ts"] != hint["candle_ts"]
+                            or last_hint[symbol]["state"] != hint["state"]
+                            or last_hint[symbol]["direction"] != hint["direction"]):
+                            tg_send_message(render_5m_hint(hint))
+                            last_hint[symbol]["candle_ts"] = hint["candle_ts"]
+                            last_hint[symbol]["state"] = hint["state"]
+                            last_hint[symbol]["direction"] = hint["direction"]
 
-                # de-dup per symbol per closed candle + direction
-                if last_signal[symbol]["candle_ts"] == trig["candle_ts"] and last_signal[symbol]["direction"] == trig["direction"]:
-                    continue
+                # ---- 15m main trigger (only reacts when refresh happened) ----
+                if cache.data[symbol]["15m"].last_closed_open_ms != prev_15m_open:
+                    trig = check_entry_trigger(symbol, df15, df1h, df4h)
+                    if trig is not None:
+                        if not (last_signal[symbol]["candle_ts"] == trig["candle_ts"] and last_signal[symbol]["direction"] == trig["direction"]):
+                            i15 = trig["i"]
+                            report = build_snapshot_report(
+                                symbol=symbol,
+                                tag="ENTRY_WATCH (15m close trigger)",
+                                direction=trig["direction"],
+                                vol_ratio=trig["vol_ratio"],
+                                df15=df15,
+                                df1h=df1h,
+                                df4h=df4h,
+                                i15=i15
+                            )
+                            tg_send_message(report)
 
-                i15 = trig["i"]
-                report = build_snapshot_report(
-                    symbol=symbol,
-                    tag="ENTRY_WATCH (15m close trigger)",
-                    direction=trig["direction"],
-                    vol_ratio=trig["vol_ratio"],
-                    df15=df15,
-                    df1h=df1h,
-                    df4h=df4h,
-                    i15=i15
-                )
-                tg_send_message(report)
-
-                last_signal[symbol]["candle_ts"] = trig["candle_ts"]
-                last_signal[symbol]["direction"] = trig["direction"]
-                health["last_signal_utc"] = utc_now_str()
-                health["last_signal_text"] = f"{symbol} {trig['direction']} @ candle {utc_ts(trig['candle_ts'])}"
+                            last_signal[symbol]["candle_ts"] = trig["candle_ts"]
+                            last_signal[symbol]["direction"] = trig["direction"]
+                            health["last_signal_utc"] = utc_now_str()
+                            health["last_signal_text"] = f"{symbol} {trig['direction']} @ candle {utc_ts(trig['candle_ts'])}"
 
             health["last_scan_utc"] = utc_now_str()
             health["scan_count"] += 1
@@ -812,7 +987,7 @@ def main():
                     tg_send_message(
                         f"{HEARTBEAT_TEXT}\n"
                         f"UTC: {utc_now_str()}\n"
-                        f"Scans: {health['scan_count']}\n"
+                        f"Ticks: {health['scan_count']}\n"
                         f"Last scan: {health['last_scan_utc'] or 'N/A'}\n"
                         f"Last signal: {health['last_signal_text'] or 'None yet'}"
                     )
@@ -822,7 +997,6 @@ def main():
             # network wobble: silent retry
             pass
         except Exception:
-            # Report errors to telegram (rate-limited)
             now = time.time()
             if (now - last_error_notify) >= ERROR_NOTIFY_COOLDOWN:
                 err = traceback.format_exc()
@@ -833,9 +1007,10 @@ def main():
                 )
                 last_error_notify = now
 
-        # 4) Keep ~fixed cadence
+        # 4) Keep cadence (tick)
         elapsed = time.time() - loop_start
-        time.sleep(max(1, int(SLEEP_TARGET_SECONDS - elapsed)))
+        sleep_for = max(0.1, SLEEP_TARGET_SECONDS - elapsed)
+        time.sleep(sleep_for)
 
 if __name__ == "__main__":
     main()
