@@ -53,6 +53,11 @@ WATCH_VOLX_5M = 1.15
 ENTRY_VOLX_5M = 1.30
 MACD_SLOPE_ATR_FACTOR_5M = 0.02
 NEAR_READY_DIST_ATR_15M = 0.80  # how close (in 15m ATR) price must be to 15m EMA20 to start 5m monitoring
+# 5m ENTRY_OK strict gating to avoid counter-trend bounces
+ENTRY_REQUIRE_VWAP_RECLAIM_15M = True      # require reclaim of 15m VWAP for ENTRY_OK
+ENTRY_REQUIRE_EMA_TREND_15M = True         # require EMA20>=EMA50 for LONG, EMA20<=EMA50 for SHORT
+ENTRY_RECLAIM_HOLD_5M_BARS = 2             # require N consecutive 5m closes on correct side of 15m VWAP
+DUMP_GUARD_RET15 = 0.006                   # block counter entries right after a strong 15m impulse (0.6%)
 
 # Telegram max length (single message)
 MAX_TG_LEN = 3500
@@ -435,17 +440,33 @@ def evaluate_5m_hint(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: p
     vwap_15 = float(df15.loc[i15, "vwap"])
     atr15 = float(df15.loc[i15, "atr14"])
 
-    bias_longish = (px > vwap_15) and (ema20_15 > ema50_15)
-    bias_shortish = (px < vwap_15) and (ema20_15 < ema50_15)
+    # 15m bias + impulse guard (LAST CLOSED 15m candle)
+    c15 = float(df15.loc[i15, "close"])
+    p15 = float(df15.loc[i15 - 1, "close"]) if i15 - 1 >= 0 else c15
+    ret15 = ((c15 - p15) / p15) if (p15 and p15 > 0) else 0.0
+
+    dir15 = "NEUTRAL"
+    if c15 > vwap_15 and ema20_15 > ema50_15:
+        dir15 = "LONG-ish"
+    elif c15 < vwap_15 and ema20_15 < ema50_15:
+        dir15 = "SHORT-ish"
 
     zone = dist_atr(px, ema20_15, atr15)
     near_zone = (zone == zone) and (zone <= NEAR_READY_DIST_ATR_15M)
 
-    near_ready_long = htf_long_ok and near_zone and (bias_longish or (px > ema20_15))
-    near_ready_short = htf_short_ok and near_zone and (bias_shortish or (px < ema20_15))
+    # After a strong 15m impulse, the first 5m bounce is often a trap → block counter entries
+    block_long = (ret15 <= -DUMP_GUARD_RET15)
+    block_short = (ret15 >= +DUMP_GUARD_RET15)
+
+    ema_trend_long_ok = (ema20_15 >= ema50_15) if ENTRY_REQUIRE_EMA_TREND_15M else True
+    ema_trend_short_ok = (ema20_15 <= ema50_15) if ENTRY_REQUIRE_EMA_TREND_15M else True
+
+    near_ready_long = htf_long_ok and near_zone and (not block_long) and ema_trend_long_ok and (dir15 != "SHORT-ish") and (px > ema20_15)
+    near_ready_short = htf_short_ok and near_zone and (not block_short) and ema_trend_short_ok and (dir15 != "LONG-ish") and (px < ema20_15)
 
     if not (near_ready_long or near_ready_short):
         return None
+
 
     # 5m momentum metrics (last closed)
     vol = float(df5.loc[i5, "volume"])
@@ -482,21 +503,53 @@ def evaluate_5m_hint(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, df1h: p
 
     # Long side
     if near_ready_long:
+        # Base momentum on 5m (LAST CLOSED)
         watch_ok = (volx == volx and volx >= WATCH_VOLX_5M) and (rsi >= 35) and (macd_slope == macd_slope and macd_slope > +slope_thr)
-        entry_ok = watch_ok and (volx >= ENTRY_VOLX_5M) and (px > ema20_5)
+
+        # Strict 15m gate: require reclaim + hold above 15m VWAP for ENTRY_OK (prevents counter-trend bounce alerts)
+        vwap_gate = True
+        if ENTRY_REQUIRE_VWAP_RECLAIM_15M:
+            vwap_gate = True
+            for k in range(ENTRY_RECLAIM_HOLD_5M_BARS):
+                j = i5 - k
+                if j < 0:
+                    vwap_gate = False
+                    break
+                if float(df5.loc[j, "close"]) <= vwap_15:
+                    vwap_gate = False
+                    break
+
+        ema_gate = (ema20_15 >= ema50_15) if ENTRY_REQUIRE_EMA_TREND_15M else True
+
+        entry_ok = watch_ok and vwap_gate and ema_gate and (volx >= ENTRY_VOLX_5M) and (px > ema20_5)
         if entry_ok:
-            return pack("ENTRY_OK", "LONG", "near_ready + 5m momentum confirmed")
+            return pack("ENTRY_OK", "LONG", "near_ready + 5m momentum confirmed + 15m VWAP reclaim/hold")
         if watch_ok:
-            return pack("SETUP_WATCH", "LONG", "near_ready + 5m momentum building")
+            return pack("SETUP_WATCH", "LONG", "near_ready + 5m momentum building (waiting 15m VWAP reclaim/hold)")
 
     # Short side
     if near_ready_short:
         watch_ok = (volx == volx and volx >= WATCH_VOLX_5M) and (rsi <= 65) and (macd_slope == macd_slope and macd_slope < -slope_thr)
-        entry_ok = watch_ok and (volx >= ENTRY_VOLX_5M) and (px < ema20_5)
+
+        vwap_gate = True
+        if ENTRY_REQUIRE_VWAP_RECLAIM_15M:
+            vwap_gate = True
+            for k in range(ENTRY_RECLAIM_HOLD_5M_BARS):
+                j = i5 - k
+                if j < 0:
+                    vwap_gate = False
+                    break
+                if float(df5.loc[j, "close"]) >= vwap_15:
+                    vwap_gate = False
+                    break
+
+        ema_gate = (ema20_15 <= ema50_15) if ENTRY_REQUIRE_EMA_TREND_15M else True
+
+        entry_ok = watch_ok and vwap_gate and ema_gate and (volx >= ENTRY_VOLX_5M) and (px < ema20_5)
         if entry_ok:
-            return pack("ENTRY_OK", "SHORT", "near_ready + 5m momentum confirmed")
+            return pack("ENTRY_OK", "SHORT", "near_ready + 5m momentum confirmed + 15m VWAP reclaim/hold")
         if watch_ok:
-            return pack("SETUP_WATCH", "SHORT", "near_ready + 5m momentum building")
+            return pack("SETUP_WATCH", "SHORT", "near_ready + 5m momentum building (waiting 15m VWAP reclaim/hold)")
 
     return None
 
