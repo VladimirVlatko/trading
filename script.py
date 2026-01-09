@@ -1092,6 +1092,19 @@ def _price_decimals(px: Optional[float]) -> int:
         return 2
     return 2
 
+
+def _dist_atr(a: float, b: float, atr: float):
+    if a is None or b is None or atr is None or atr == 0:
+        return None
+    return abs(a - b) / atr
+
+def _range_high_low(df, bars: int):
+    if df is None or len(df) < bars + 2:
+        return (None, None)
+    window = df.iloc[-(bars+1):-1]
+    return float(window['high'].max()), float(window['low'].min())
+
+
 def build_compact_all_report(cache: "MarketCache") -> str:
     """One Telegram message: rows=metrics, cols=BTC/ETH/SOL (keeps core signal context)."""
     snap: Dict[str, Dict[str, object]] = {}
@@ -1119,8 +1132,11 @@ def build_compact_all_report(cache: "MarketCache") -> str:
         basis = ((mark - indexp) / indexp * 100.0) if (_valid(mark, indexp) and indexp != 0) else None
         try:
             oi = fetch_open_interest(sym)
+            oi_prev = cache.get_prev_oi(sym)
+            doi = (oi - oi_prev) if (oi is not None and oi_prev is not None) else None
         except Exception:
             oi = None
+            doi = None
 
         # Scores (15m+HTF)
         long_q = calculate_quality_score_v3(sym, df15, df5, df1h, df4h, "LONG")
@@ -1177,7 +1193,7 @@ def build_compact_all_report(cache: "MarketCache") -> str:
             "rsi1": s1.get("rsi"), "volx1": s1.get("volx"),
         }
 
-    W = 16
+    W = 20
 
     def cell(value: str) -> str:
         return _fmt(value, W)
