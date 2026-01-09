@@ -1053,6 +1053,219 @@ class SignalHistory:
 # ============================================================
 # Command Parsing
 # ============================================================
+# ============================================================
+# COMPACT /report ALL (single Telegram message, table format)
+# ============================================================
+
+def _fmt(x: object, w: int = 12) -> str:
+    s = str(x)
+    if len(s) > w:
+        s = s[:w]
+    return s.rjust(w)
+
+def _fmt_f(x: Optional[float], w: int = 12, d: int = 2, na: str = "N/A") -> str:
+    if x is None or not (x == x):
+        return na.rjust(w)
+    return f"{x:.{d}f}".rjust(w)
+
+def _fmt_pct(x: Optional[float], w: int = 12, d: int = 3, na: str = "N/A") -> str:
+    if x is None or not (x == x):
+        return na.rjust(w)
+    return f"{x:.{d}f}%".rjust(w)
+
+def _fmt_ratio(x: Optional[float], w: int = 12, d: int = 1, na: str = "N/A") -> str:
+    if x is None or not (x == x):
+        return na.rjust(w)
+    return f"{x*100:.{d}f}%".rjust(w)
+
+def _fmt_int(x: Optional[float], w: int = 12, na: str = "N/A") -> str:
+    if x is None or not (x == x):
+        return na.rjust(w)
+    return f"{int(round(x))}".rjust(w)
+
+def _price_decimals(px: Optional[float]) -> int:
+    if px is None or not (px == px):
+        return 2
+    if px >= 10000:
+        return 1
+    if px >= 1000:
+        return 2
+    return 2
+
+def build_compact_all_report(cache: "MarketCache") -> str:
+    """One Telegram message: rows=metrics, cols=BTC/ETH/SOL (keeps core signal context)."""
+    snap: Dict[str, Dict[str, object]] = {}
+
+    for sym in SYMBOLS:
+        cache.refresh_15m_force(sym)
+        cache.refresh_5m_force(sym)
+        cache.refresh_1m_force(sym)
+        cache.ensure_context_ready(sym)
+
+        df15 = cache.get(sym, "15m")
+        df5 = cache.get(sym, "5m")
+        df1 = cache.get(sym, "1m")
+        df1h = cache.get(sym, "1h")
+        df4h = cache.get(sym, "4h")
+
+        i15 = len(df15) - 2  # LAST CLOSED candle
+        px = safe_float(df15.loc[i15, "close"])
+
+        # Derivatives
+        prem = fetch_premium_index(sym)
+        mark = safe_float(prem.get("markPrice")) or px
+        indexp = safe_float(prem.get("indexPrice"))
+        funding = safe_float(prem.get("lastFundingRate"))
+        basis = ((mark - indexp) / indexp * 100.0) if (_valid(mark, indexp) and indexp != 0) else None
+        try:
+            oi = fetch_open_interest(sym)
+        except Exception:
+            oi = None
+
+        # Scores (15m+HTF)
+        long_q = calculate_quality_score_v3(sym, df15, df5, df1h, df4h, "LONG")
+        short_q = calculate_quality_score_v3(sym, df15, df5, df1h, df4h, "SHORT")
+        L = int(long_q.get("score", 0))
+        S = int(short_q.get("score", 0))
+        direction = "LONG" if L > S else ("SHORT" if S > L else "MIX")
+        diff = abs(L - S)
+
+        if max(L, S) >= QUALITY_SCORE_ENTRY and diff >= MIN_SCORE_DIFF:
+            level = "ENTRY"
+        elif max(L, S) >= QUALITY_SCORE_WATCH and diff >= MIN_SCORE_DIFF:
+            level = "WATCH"
+        else:
+            level = "NO"
+
+        # HTF
+        _, _, htf = check_htf_alignment(df1h, df4h)
+        h1 = ("ABV" if htf.get("1h_above_200") else "BLW") + f"({(htf.get('1h_strength') or 'N/A')[0]})"
+        h4 = ("ABV" if htf.get("4h_above_200") else "BLW") + f"({(htf.get('4h_strength') or 'N/A')[0]})"
+
+        # 15m core
+        ema20 = safe_float(df15.loc[i15, "ema20"])
+        ema50 = safe_float(df15.loc[i15, "ema50"])
+        ema200 = safe_float(df15.loc[i15, "ema200"])
+        vwap = safe_float(df15.loc[i15, "vwap"])
+        atr = safe_float(df15.loc[i15, "atr14"])
+        rsi = safe_float(df15.loc[i15, "rsi14"])
+        macdh = safe_float(df15.loc[i15, "macdh"])
+        macdh_prev = safe_float(df15.loc[i15 - 1, "macdh"]) if i15 > 0 else None
+        macd_slope = (macdh - macdh_prev) if (_valid(macdh, macdh_prev)) else None
+
+        vol = safe_float(df15.loc[i15, "volume"])
+        vol_sma = safe_float(df15.loc[i15, "vol_sma20"])
+        volx = (vol / vol_sma) if (_valid(vol, vol_sma) and vol_sma > 0) else None
+
+        aggr = safe_float(df15.loc[i15, "aggressor_buy_ratio"])
+        delta = safe_float(df15.loc[i15, "delta"])
+        delta5 = safe_float(df15.loc[i15, "delta_cumsum_5"])
+
+        # MTF snapshots
+        s5 = get_5m_snapshot(df5)
+        s1 = get_1m_snapshot(df1)
+
+        snap[sym] = {
+            "level": level, "dir": direction, "L": L, "S": S,
+            "px": px, "mark": mark, "basis": basis, "funding": funding, "oi": oi,
+            "h1": h1, "h4": h4,
+            "ema20": ema20, "ema50": ema50, "ema200": ema200,
+            "vwap": vwap, "atr": atr,
+            "rsi": rsi, "macdh": macdh, "slope": macd_slope,
+            "volx": volx, "aggr": aggr, "delta": delta, "delta5": delta5,
+            "rsi5": s5.get("rsi"), "volx5": s5.get("volx"),
+            "rsi1": s1.get("rsi"), "volx1": s1.get("volx"),
+        }
+
+    W = 16
+
+    def cell(value: str) -> str:
+        return _fmt(value, W)
+
+    def f(sym: str, key: str, d: int = 2) -> str:
+        return _fmt_f(snap[sym].get(key), W, d)
+
+    def i(sym: str, key: str) -> str:
+        return _fmt_int(snap[sym].get(key), W)
+
+    def ratio(sym: str, key: str) -> str:
+        return _fmt_ratio(snap[sym].get(key), W, 1)
+
+    lines: list[str] = []
+    lines.append("```")
+    lines.append(f"MANUAL REPORT (ALL) | UTC: {utc_now_str()}")
+    hdr = f"{'PARAM'.ljust(14)}|{'BTC'.rjust(W)}|{'ETH'.rjust(W)}|{'SOL'.rjust(W)}"
+    sep = "-" * len(hdr)
+    lines.append(sep)
+    lines.append(hdr)
+    lines.append(sep)
+
+    btc_lvl = f"{snap['BTCUSDT']['level']} {snap['BTCUSDT']['dir']}({snap['BTCUSDT']['L']}-{snap['BTCUSDT']['S']})"
+    eth_lvl = f"{snap['ETHUSDT']['level']} {snap['ETHUSDT']['dir']}({snap['ETHUSDT']['L']}-{snap['ETHUSDT']['S']})"
+    sol_lvl = f"{snap['SOLUSDT']['level']} {snap['SOLUSDT']['dir']}({snap['SOLUSDT']['L']}-{snap['SOLUSDT']['S']})"
+    lines.append(f"{'Lvl/Dir(L-S)'.ljust(14)}|{cell(btc_lvl)}|{cell(eth_lvl)}|{cell(sol_lvl)}")
+
+    btc_pm = f"{float(snap['BTCUSDT']['px']):.1f}/{float(snap['BTCUSDT']['mark']):.1f}"
+    eth_pm = f"{float(snap['ETHUSDT']['px']):.2f}/{float(snap['ETHUSDT']['mark']):.2f}"
+    sol_pm = f"{float(snap['SOLUSDT']['px']):.2f}/{float(snap['SOLUSDT']['mark']):.2f}"
+    lines.append(f"{'Price / Mark'.ljust(14)}|{cell(btc_pm)}|{cell(eth_pm)}|{cell(sol_pm)}")
+
+    btc_bf = f"{(snap['BTCUSDT']['basis'] or 0):+.3f}%/{(snap['BTCUSDT']['funding'] or 0)*100:.4f}%"
+    eth_bf = f"{(snap['ETHUSDT']['basis'] or 0):+.3f}%/{(snap['ETHUSDT']['funding'] or 0)*100:.4f}%"
+    sol_bf = f"{(snap['SOLUSDT']['basis'] or 0):+.3f}%/{(snap['SOLUSDT']['funding'] or 0)*100:.4f}%"
+    lines.append(f"{'Basis / Fund'.ljust(14)}|{cell(btc_bf)}|{cell(eth_bf)}|{cell(sol_bf)}")
+
+    lines.append(f"{'OI'.ljust(14)}|{i('BTCUSDT','oi')}|{i('ETHUSDT','oi')}|{i('SOLUSDT','oi')}")
+
+    btc_htf = f"{snap['BTCUSDT']['h1']}/{snap['BTCUSDT']['h4']}"
+    eth_htf = f"{snap['ETHUSDT']['h1']}/{snap['ETHUSDT']['h4']}"
+    sol_htf = f"{snap['SOLUSDT']['h1']}/{snap['SOLUSDT']['h4']}"
+    lines.append(f"{'HTF 1h / 4h'.ljust(14)}|{cell(btc_htf)}|{cell(eth_htf)}|{cell(sol_htf)}")
+
+    lines.append(sep)
+
+    btc_emas = f"{float(snap['BTCUSDT']['ema20']):.0f}/{float(snap['BTCUSDT']['ema50']):.0f}/{float(snap['BTCUSDT']['ema200']):.0f}"
+    eth_emas = f"{float(snap['ETHUSDT']['ema20']):.1f}/{float(snap['ETHUSDT']['ema50']):.1f}/{float(snap['ETHUSDT']['ema200']):.1f}"
+    sol_emas = f"{float(snap['SOLUSDT']['ema20']):.2f}/{float(snap['SOLUSDT']['ema50']):.2f}/{float(snap['SOLUSDT']['ema200']):.2f}"
+    lines.append(f"{'EMA20/50/200'.ljust(14)}|{cell(btc_emas)}|{cell(eth_emas)}|{cell(sol_emas)}")
+
+    btc_va = f"{float(snap['BTCUSDT']['vwap']):.0f}/{float(snap['BTCUSDT']['atr']):.0f}"
+    eth_va = f"{float(snap['ETHUSDT']['vwap']):.1f}/{float(snap['ETHUSDT']['atr']):.1f}"
+    sol_va = f"{float(snap['SOLUSDT']['vwap']):.2f}/{float(snap['SOLUSDT']['atr']):.2f}"
+    lines.append(f"{'VWAP / ATR'.ljust(14)}|{cell(btc_va)}|{cell(eth_va)}|{cell(sol_va)}")
+
+    btc_rm = f"{float(snap['BTCUSDT']['rsi']):.1f}/{float(snap['BTCUSDT']['macdh']):.2f}"
+    eth_rm = f"{float(snap['ETHUSDT']['rsi']):.1f}/{float(snap['ETHUSDT']['macdh']):.2f}"
+    sol_rm = f"{float(snap['SOLUSDT']['rsi']):.1f}/{float(snap['SOLUSDT']['macdh']):.2f}"
+    lines.append(f"{'RSI / MACDH'.ljust(14)}|{cell(btc_rm)}|{cell(eth_rm)}|{cell(sol_rm)}")
+
+    lines.append(f"{'MACD slope'.ljust(14)}|{f('BTCUSDT','slope',2)}|{f('ETHUSDT','slope',2)}|{f('SOLUSDT','slope',2)}")
+    lines.append(f"{'VOLx'.ljust(14)}|{f('BTCUSDT','volx',2)}|{f('ETHUSDT','volx',2)}|{f('SOLUSDT','volx',2)}")
+    lines.append(f"{'AggrBuy'.ljust(14)}|{ratio('BTCUSDT','aggr')}|{ratio('ETHUSDT','aggr')}|{ratio('SOLUSDT','aggr')}")
+
+    btc_d = f"{float(snap['BTCUSDT']['delta']):.0f}/{float(snap['BTCUSDT']['delta5']):.0f}"
+    eth_d = f"{float(snap['ETHUSDT']['delta']):.0f}/{float(snap['ETHUSDT']['delta5']):.0f}"
+    sol_d = f"{float(snap['SOLUSDT']['delta']):.0f}/{float(snap['SOLUSDT']['delta5']):.0f}"
+    lines.append(f"{'Delta / Δ5'.ljust(14)}|{cell(btc_d)}|{cell(eth_d)}|{cell(sol_d)}")
+
+    lines.append(sep)
+
+    btc_5 = f"{float(snap['BTCUSDT']['rsi5'] or 0):.1f}/{float(snap['BTCUSDT']['volx5'] or 0):.2f}x"
+    eth_5 = f"{float(snap['ETHUSDT']['rsi5'] or 0):.1f}/{float(snap['ETHUSDT']['volx5'] or 0):.2f}x"
+    sol_5 = f"{float(snap['SOLUSDT']['rsi5'] or 0):.1f}/{float(snap['SOLUSDT']['volx5'] or 0):.2f}x"
+    lines.append(f"{'5m RSI / VOLx'.ljust(14)}|{cell(btc_5)}|{cell(eth_5)}|{cell(sol_5)}")
+
+    btc_1 = f"{float(snap['BTCUSDT']['rsi1'] or 0):.1f}/{float(snap['BTCUSDT']['volx1'] or 0):.2f}x"
+    eth_1 = f"{float(snap['ETHUSDT']['rsi1'] or 0):.1f}/{float(snap['ETHUSDT']['volx1'] or 0):.2f}x"
+    sol_1 = f"{float(snap['SOLUSDT']['rsi1'] or 0):.1f}/{float(snap['SOLUSDT']['volx1'] or 0):.2f}x"
+    lines.append(f"{'1m RSI / VOLx'.ljust(14)}|{cell(btc_1)}|{cell(eth_1)}|{cell(sol_1)}")
+
+    lines.append("```")
+
+    msg = "\n".join(lines)
+    return msg[:MAX_TG_LEN]
+
+
 def parse_command(text: str):
     if not text:
         return None, None
@@ -1152,14 +1365,8 @@ def main():
 
                         try:
                             if arg is None:
-                                for idx, sym in enumerate(SYMBOLS):
-                                    try:
-                                        report = generate_manual_report_v3(sym, cache)
-                                        tg_send_message(report)
-                                        if idx != len(SYMBOLS) - 1:
-                                            time.sleep(1.2)
-                                    except Exception as sym_err:
-                                        tg_send_message(f"❌ Error for {sym}: {str(sym_err)[:180]}")
+                                report_all = build_compact_all_report(cache)
+                                tg_send_message(report_all)
                             else:
                                 if arg in SYMBOLS:
                                     report = generate_manual_report_v3(arg, cache)
