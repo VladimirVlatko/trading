@@ -1076,6 +1076,7 @@ def main():
         )
     
     offset = None
+    last_processed_update_id = 0  # Track processed updates to avoid duplicates
     
     while True:
         loop_start = time.time()
@@ -1089,7 +1090,14 @@ def main():
             
             if isinstance(upd, dict) and upd.get("ok") and upd.get("result"):
                 for u in upd["result"]:
-                    offset = u["update_id"] + 1
+                    update_id = u["update_id"]
+                    offset = update_id + 1
+                    
+                    # Skip if already processed (safety check)
+                    if update_id <= last_processed_update_id:
+                        continue
+                    last_processed_update_id = update_id
+                    
                     msg = u.get("message") or {}
                     chat = msg.get("chat") or {}
                     chat_id = str(chat.get("id", ""))
@@ -1101,17 +1109,32 @@ def main():
                     cmd, arg = parse_command(text)
                     
                     if cmd == "/report":
-                        if arg is None:
-                            for sym in SYMBOLS:
-                                report = generate_manual_report_v3(sym, cache)
-                                tg_send_message(report)
-                                time.sleep(1.0)
-                        else:
-                            if arg in SYMBOLS:
-                                report = generate_manual_report_v3(arg, cache)
-                                tg_send_message(report)
+                        try:
+                            if arg is None:
+                                # Report all symbols - send them sequentially with delay
+                                reports_sent = 0
+                                for sym in SYMBOLS:
+                                    try:
+                                        report = generate_manual_report_v3(sym, cache)
+                                        tg_send_message(report)
+                                        reports_sent += 1
+                                        if sym != SYMBOLS[-1]:  # Don't sleep after last one
+                                            time.sleep(1.5)
+                                    except Exception as sym_err:
+                                        tg_send_message(f"❌ Error for {sym}: {str(sym_err)[:100]}")
+                                
+                                if reports_sent == 0:
+                                    tg_send_message("❌ No reports generated")
                             else:
-                                tg_send_message(f"❌ Invalid symbol. Use: {', '.join(SYMBOLS)}")
+                                if arg in SYMBOLS:
+                                    report = generate_manual_report_v3(arg, cache)
+                                    tg_send_message(report)
+                                else:
+                                    tg_send_message(f"❌ Invalid symbol. Use: {', '.join(SYMBOLS)}")
+                        except Exception as e:
+                            error_msg = f"❌ Report error: {str(e)[:200]}"
+                            tg_send_message(error_msg)
+                            print(f"Report error: {traceback.format_exc()}")
                     
                     elif cmd == "/status":
                         uptime_min = int((time.time() - start_ts) / 60)
