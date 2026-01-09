@@ -25,6 +25,202 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BINANCE_FAPI = "https://fapi.binance.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
+
+
+# ============================================================
+# 10s ENTRY CHECKLIST — per-symbol thresholds (retail edge)
+# ============================================================
+CHECKLIST_THRESHOLDS: Dict[str, Dict[str, float]] = {
+    # BTC: cleaner moves, stricter reclaim, tighter SL/RR
+    "BTCUSDT": {
+        "volx15_min": 0.80, "volx15_max": 1.40,
+        "volx1_max": 2.00,
+        "rsi_long_min": 51.0, "rsi_short_max": 49.0,
+        "reclaim_mode": "AND",   # EMA20 AND VWAP
+        "absorb_lookback": 5, "absorb_buf_atr": 0.05,
+        "rej_dist_max": 0.80,
+        "sl_atr_cap": 0.80,
+        "rr_min": 1.60,
+        "grade_a_min": 60.0, "grade_aplus_min": 75.0,
+    },
+    # ETH: balanced, avoid chop, slightly looser than BTC
+    "ETHUSDT": {
+        "volx15_min": 0.85, "volx15_max": 1.60,
+        "volx1_max": 2.20,
+        "rsi_long_min": 50.0, "rsi_short_max": 50.0,
+        "reclaim_mode": "EMA",   # EMA20 only (VWAP optional)
+        "absorb_lookback": 5, "absorb_buf_atr": 0.06,
+        "rej_dist_max": 0.90,
+        "sl_atr_cap": 0.90,
+        "rr_min": 1.50,
+        "grade_a_min": 60.0, "grade_aplus_min": 75.0,
+    },
+    # SOL: hotter coin, allow more noise but control spikes
+    "SOLUSDT": {
+        "volx15_min": 0.90, "volx15_max": 1.90,
+        "volx1_max": 2.80,
+        "rsi_long_min": 50.0, "rsi_short_max": 50.0,
+        "reclaim_mode": "OR",    # EMA20 OR VWAP
+        "absorb_lookback": 6, "absorb_buf_atr": 0.10,
+        "rej_dist_max": 1.00,
+        "sl_atr_cap": 1.00,
+        "rr_min": 1.40,
+        "grade_a_min": 60.0, "grade_aplus_min": 75.0,
+    },
+}
+
+def _get_th(symbol: str) -> Dict[str, float]:
+    return CHECKLIST_THRESHOLDS.get(symbol, CHECKLIST_THRESHOLDS["BTCUSDT"])
+
+def _reclaim_ok(px: Optional[float], ema20: Optional[float], vwap: Optional[float], mode: str) -> bool:
+    if not _valid(px):
+        return False
+    ok_ema = _valid(ema20) and px > ema20
+    ok_vwap = _valid(vwap) and px > vwap
+    if mode == "AND":
+        return ok_ema and ok_vwap
+    if mode == "EMA":
+        return ok_ema
+    if mode == "VWAP":
+        return ok_vwap
+    # OR (default)
+    return ok_ema or ok_vwap
+
+def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """10 quick YES/NO gates — deterministic, per-symbol thresholds.
+    Note: this is NOT a signal. It is a tradeability gate for alerts/reports.
+    """
+    th = _get_th(symbol)
+    df15 = cache.get(symbol, "15m")
+    df1 = cache.get(symbol, "1m")
+    df1h = cache.get(symbol, "1h")
+    df4h = cache.get(symbol, "4h")
+    if df15 is None or len(df15) < 30:
+        return {"items": [], "yes": 0, "no": 10, "gate": "NO TRADE", "reason": "Not enough data"}
+
+    i15 = len(df15) - 2  # LAST CLOSED
+    px = safe_float(df15.loc[i15, "close"])
+    ema20 = safe_float(df15.loc[i15, "ema20"])
+    ema50 = safe_float(df15.loc[i15, "ema50"])
+    vwap = safe_float(df15.loc[i15, "vwap"])
+    atr = safe_float(df15.loc[i15, "atr14"])
+    rsi = safe_float(df15.loc[i15, "rsi14"])
+
+    # VOLx 15m
+    vol = safe_float(df15.loc[i15, "volume"])
+    vol_avg = safe_float(df15.loc[i15, "vol_sma20"])
+    volx15 = (vol / vol_avg) if (_valid(vol, vol_avg) and vol_avg > 0) else 0.0
+
+    # 1m spike filter
+    volx1 = 0.0
+    if df1 is not None and len(df1) >= 25:
+        i1 = len(df1) - 2
+        v1 = safe_float(df1.loc[i1, "volume"])
+        v1a = safe_float(df1.loc[i1, "vol_sma20"])
+        volx1 = (v1 / v1a) if (_valid(v1, v1a) and v1a > 0) else 0.0
+
+    # 1) Trend OK (HTF alignment)
+    htf_long, htf_short, _ = check_htf_alignment(df1h, df4h)
+    trend_ok = htf_long if direction == "LONG" else htf_short
+
+    # 2) Reclaim EMA/VWAP
+    reclaim_ok = _reclaim_ok(px, ema20, vwap, str(th.get("reclaim_mode", "OR")))
+
+    # 3) Healthy VOLx (15m)
+    vol_ok = (volx15 >= th["volx15_min"]) and (volx15 <= th["volx15_max"])
+
+    # 4) RSI supports
+    rsi_ok = (rsi >= th["rsi_long_min"]) if direction == "LONG" else (rsi <= th["rsi_short_max"])
+
+    # 5) No breakdown / absorption (proxy)
+    lb = int(th.get("absorb_lookback", 5))
+    buf = float(th.get("absorb_buf_atr", 0.05))
+    no_break = False
+    if _valid(px, atr) and atr > 0 and i15 - lb >= 2:
+        prev = df15.iloc[i15 - lb:i15]  # exclude current closed candle
+        prev_low = safe_float(prev["low"].min()) if "low" in prev else None
+        prev_high = safe_float(prev["high"].max()) if "high" in prev else None
+        if direction == "LONG":
+            no_break = _valid(prev_low) and px > (prev_low + buf * atr)
+        else:
+            no_break = _valid(prev_high) and px < (prev_high - buf * atr)
+    else:
+        prev_low = prev_high = None
+
+    # 6) Rejections weakening (proxy: dist to EMA20 improving + below max dist)
+    dist_now = _dist_atr(px, ema20, atr) if _valid(px, ema20, atr) else None
+    dist_prev = None
+    if i15 - 1 >= 1:
+        pxp = safe_float(df15.loc[i15 - 1, "close"])
+        emap = safe_float(df15.loc[i15 - 1, "ema20"])
+        atrp = safe_float(df15.loc[i15 - 1, "atr14"])
+        dist_prev = _dist_atr(pxp, emap, atrp) if _valid(pxp, emap, atrp) else None
+    rej_ok = (dist_now is not None) and (dist_now <= float(th.get("rej_dist_max", 0.9))) and (dist_prev is None or dist_now <= dist_prev)
+
+    # 7) Clear SL (must exist and be <= cap*ATR)
+    sl_ok = False
+    sl_dist = None
+    if _valid(px, atr) and atr > 0:
+        if direction == "LONG" and _valid(prev_low):
+            sl_dist = px - prev_low
+        elif direction == "SHORT" and _valid(prev_high):
+            sl_dist = prev_high - px
+        if _valid(sl_dist) and sl_dist > 0:
+            sl_ok = (sl_dist <= float(th.get("sl_atr_cap", 1.0)) * atr)
+
+    # 8) RR >= rr_min (target: nearest of VWAP/EMA50 in direction)
+    rr_ok = False
+    rr_min = float(th.get("rr_min", 1.5))
+    if sl_ok and _valid(sl_dist) and sl_dist > 0:
+        targets = []
+        if direction == "LONG":
+            if _valid(vwap) and vwap > px: targets.append(vwap)
+            if _valid(ema50) and ema50 > px: targets.append(ema50)
+            if targets:
+                tp = min(targets)  # nearest logical target
+                rr_ok = (tp - px) >= rr_min * sl_dist
+        else:
+            if _valid(vwap) and vwap < px: targets.append(vwap)
+            if _valid(ema50) and ema50 < px: targets.append(ema50)
+            if targets:
+                tp = max(targets)  # nearest logical target below (closest)
+                rr_ok = (px - tp) >= rr_min * sl_dist
+
+    # 9) Grade A/A+ (objective)
+    qscore = float(signal.get("quality_score", 0)) if isinstance(signal, dict) else 0.0
+    long_s = float(signal.get("long_score", 0)) if isinstance(signal, dict) else 0.0
+    short_s = float(signal.get("short_score", 0)) if isinstance(signal, dict) else 0.0
+    diff = abs(long_s - short_s)
+    grade_ok = (qscore >= float(th.get("grade_a_min", 60.0))) and (diff >= MIN_SCORE_DIFF)
+
+    # 10) Calm / no spike (1m)
+    calm_ok = (volx1 <= float(th.get("volx1_max", 2.0)))
+
+    items = [
+        ("Trend OK", trend_ok),
+        ("Reclaim EMA/VWAP", reclaim_ok),
+        ("Healthy VOLx(15m)", vol_ok),
+        ("RSI supports", rsi_ok),
+        ("No breakdown", no_break),
+        ("Rejections weakening", rej_ok),
+        ("Clear SL", sl_ok),
+        (f"RR>={rr_min:.1f}", rr_ok),
+        ("Grade A/A+", grade_ok),
+        ("Calm (1m)", calm_ok),
+    ]
+    yes = sum(1 for _, v in items if v)
+    gate = "VALID ENTRY" if yes == 10 else "NO TRADE"
+    return {"items": items, "yes": yes, "no": 10 - yes, "gate": gate, "volx15": volx15, "volx1": volx1}
+
+def format_checklist_block(check: Dict[str, Any], symbol: str = "") -> str:
+    if not check or not check.get("items"):
+        return "⏱ 10s CHECKLIST: N/A"
+    lines = ["⏱ 10s ENTRY CHECKLIST" + (f" ({symbol})" if symbol else "") + ":"]
+    for name, ok in check["items"]:
+        lines.append(f"  {'YES' if ok else 'NO '} | {name}")
+    lines.append(f"GATE: {check['gate']} ({check['yes']}/10 YES)")
+    return "\n".join(lines)
+
 # Loop tick: relaxed for rate-limit safety
 SLEEP_TARGET_SECONDS = 2.0  # Was 0.5 → now 2.0 for stability
 
@@ -907,6 +1103,25 @@ def generate_leverage_report_v3(signal: Dict[str, Any], cache: "MarketCache") ->
         "4) What are the key risks?",
         "5) Suggested entry zones and stop-loss?",
     ]
+
+    # --- 10s YES/NO checklist gate (per-symbol thresholds) ---
+    try:
+        check = compute_10s_checklist(symbol, direction, cache, signal)
+        idx = None
+        for j, ln in enumerate(lines):
+            if ln == "🤖 FOR GPT ANALYSIS:":
+                idx = j
+                break
+        if idx is None:
+            lines.append("")
+            lines.append(format_checklist_block(check))
+        else:
+            lines.insert(idx, "")
+            lines.insert(idx + 1, format_checklist_block(check))
+            lines.insert(idx + 2, "")
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 
@@ -976,6 +1191,18 @@ def generate_manual_report_v3(symbol: str, cache: "MarketCache") -> str:
 
     status_line = "⚠️ No high-quality setup (need ≥60 & diff≥10)" if max(long_score, short_score) < QUALITY_SCORE_WATCH else "✅ Setup detected but scores too close (chop)"
 
+
+    # --- 10s YES/NO checklist gate (manual context) ---
+    direction_best = "LONG" if long_score > short_score else ("SHORT" if short_score > long_score else "LONG")
+    pseudo_signal = {"quality_score": max(long_score, short_score), "long_score": long_score, "short_score": short_score}
+    try:
+        _chk = compute_10s_checklist(symbol, direction_best, cache, pseudo_signal)
+        _chk_txt = format_checklist_block(_chk)
+    except Exception:
+        _chk_txt = "⏱ 10s CHECKLIST: N/A"
+
+
+
     return (
         f"📊 {symbol} COMPREHENSIVE STATUS (v3.1)\n"
         f"Time: {utc_now_str()}\n"
@@ -1010,7 +1237,7 @@ def generate_manual_report_v3(symbol: str, cache: "MarketCache") -> str:
         f"  Volume: {long_q['breakdown'].get('volume', 0)}/10 (L) | {short_q['breakdown'].get('volume', 0)}/10 (S)\n"
         f"  Flow: {long_q['breakdown'].get('order_flow', 0)}/20 (L) | {short_q['breakdown'].get('order_flow', 0)}/20 (S)\n"
         f"  MTF: {long_q['breakdown'].get('mtf_bonus', 0)}/10 (L) | {short_q['breakdown'].get('mtf_bonus', 0)}/10 (S)\n\n"
-        f"{'=' * 60}\n"
+        f"{_chk_txt}\n\n"f"{'=' * 60}\n"
         f"🤖 FOR GPT ANALYSIS:\n\n"
         f"Scores are below trigger or too close.\n"
         f"What needs to change on 15m for a clean signal (≥{QUALITY_SCORE_WATCH} and diff≥{MIN_SCORE_DIFF})?\n"
@@ -1276,6 +1503,22 @@ def build_compact_all_report(cache: "MarketCache") -> str:
     sol_1 = f"{float(snap['SOLUSDT']['rsi1'] or 0):.1f}/{float(snap['SOLUSDT']['volx1'] or 0):.2f}x"
     lines.append(f"{'1m RSI / VOLx'.ljust(14)}|{cell(btc_1)}|{cell(eth_1)}|{cell(sol_1)}")
 
+
+    # 10s checklist summary (YES count) — per symbol thresholds
+    try:
+        def _chk_yes(sym_key: str) -> str:
+            d = snap[sym_key]["dir"] if snap[sym_key]["dir"] in ("LONG", "SHORT") else "LONG"
+            pseudo = {"quality_score": max(snap[sym_key]["L"], snap[sym_key]["S"]),
+                      "long_score": snap[sym_key]["L"], "short_score": snap[sym_key]["S"]}
+            chk = compute_10s_checklist(sym_key, d, cache, pseudo)
+            return f"{chk.get('yes', 0)}/10"
+        btc_c = _chk_yes("BTCUSDT")
+        eth_c = _chk_yes("ETHUSDT")
+        sol_c = _chk_yes("SOLUSDT")
+    except Exception:
+        btc_c = eth_c = sol_c = "N/A"
+
+    lines.append(f"{'Checklist Y/N'.ljust(14)}|{cell(btc_c)}|{cell(eth_c)}|{cell(sol_c)}")
     lines.append("```")
 
     msg = "\n".join(lines)
