@@ -130,20 +130,31 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
     vol_ok = (volx15 >= th["volx15_min"]) and (volx15 <= th["volx15_max"])
 
     # 4) RSI supports
-    rsi_ok = (rsi >= th["rsi_long_min"]) if direction == "LONG" else (rsi <= th["rsi_short_max"])
+    if direction == "LONG":
+        rsi_ok = (rsi >= th["rsi_long_min"])
+    elif direction == "SHORT":
+        rsi_ok = (rsi <= th["rsi_short_max"])
+    else:
+        rsi_ok = False
 
-    # 5) No breakdown / absorption (proxy)
+    # 5) No breakdown / absorption (proxy: no new extreme in lookback)
     lb = int(th.get("absorb_lookback", 5))
     buf = float(th.get("absorb_buf_atr", 0.05))
     no_break = False
-    if _valid(px, atr) and atr > 0 and i15 - lb >= 2:
-        prev = df15.iloc[i15 - lb:i15]  # exclude current closed candle
-        prev_low = safe_float(prev["low"].min()) if "low" in prev else None
-        prev_high = safe_float(prev["high"].max()) if "high" in prev else None
+    if _valid(px, atr) and atr > 0 and i15 - lb >= 2 and "low" in df15 and "high" in df15:
+        prev = df15.iloc[i15 - lb:i15]  # previous closed candles (exclude last closed)
+        prev_low = safe_float(prev["low"].min())
+        prev_high = safe_float(prev["high"].max())
+        last_low = safe_float(df15.loc[i15, "low"])
+        last_high = safe_float(df15.loc[i15, "high"])
         if direction == "LONG":
-            no_break = _valid(prev_low) and px > (prev_low + buf * atr)
+            # bullish absorption: last candle does NOT print a new low vs the prior window
+            no_break = _valid(prev_low, last_low) and last_low >= (prev_low + buf * atr)
+        elif direction == "SHORT":
+            # bearish absorption: last candle does NOT print a new high vs the prior window
+            no_break = _valid(prev_high, last_high) and last_high <= (prev_high - buf * atr)
         else:
-            no_break = _valid(prev_high) and px < (prev_high - buf * atr)
+            no_break = False
     else:
         prev_low = prev_high = None
 
@@ -1503,23 +1514,36 @@ def build_compact_all_report(cache: "MarketCache") -> str:
     sol_1 = f"{float(snap['SOLUSDT']['rsi1'] or 0):.1f}/{float(snap['SOLUSDT']['volx1'] or 0):.2f}x"
     lines.append(f"{'1m RSI / VOLx'.ljust(14)}|{cell(btc_1)}|{cell(eth_1)}|{cell(sol_1)}")
 
-
     # 10s checklist summary (YES count) — per symbol thresholds
+    chk_map: Dict[str, Dict[str, Any]] = {}
     try:
-        def _chk_yes(sym_key: str) -> str:
+        for sym_key in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
             d = snap[sym_key]["dir"] if snap[sym_key]["dir"] in ("LONG", "SHORT") else "LONG"
-            pseudo = {"quality_score": max(snap[sym_key]["L"], snap[sym_key]["S"]),
-                      "long_score": snap[sym_key]["L"], "short_score": snap[sym_key]["S"]}
-            chk = compute_10s_checklist(sym_key, d, cache, pseudo)
-            return f"{chk.get('yes', 0)}/10"
-        btc_c = _chk_yes("BTCUSDT")
-        eth_c = _chk_yes("ETHUSDT")
-        sol_c = _chk_yes("SOLUSDT")
+            pseudo = {
+                "quality_score": max(snap[sym_key]["L"], snap[sym_key]["S"]),
+                "long_score": snap[sym_key]["L"],
+                "short_score": snap[sym_key]["S"],
+            }
+            chk_map[sym_key] = compute_10s_checklist(sym_key, d, cache, pseudo)
+        btc_c = f"{chk_map['BTCUSDT'].get('yes', 0)}/10"
+        eth_c = f"{chk_map['ETHUSDT'].get('yes', 0)}/10"
+        sol_c = f"{chk_map['SOLUSDT'].get('yes', 0)}/10"
     except Exception:
+        chk_map = {}
         btc_c = eth_c = sol_c = "N/A"
 
     lines.append(f"{'Checklist Y/N'.ljust(14)}|{cell(btc_c)}|{cell(eth_c)}|{cell(sol_c)}")
+
     lines.append("```")
+
+    # 10s checklist details (named items)
+    if isinstance(chk_map, dict) and chk_map:
+        for sym_key in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+            chk = chk_map.get(sym_key)
+            if not chk or not chk.get("items"):
+                continue
+            parts = [f"{name}={'Y' if ok else 'N'}" for name, ok in chk["items"]]
+            lines.append(f"⏱ 10s CHECKLIST {sym_key} ({chk.get('yes', 0)}/10): " + "; ".join(parts))
 
     msg = "\n".join(lines)
     return msg[:MAX_TG_LEN]
