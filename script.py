@@ -75,6 +75,53 @@ CHECKLIST_THRESHOLDS: Dict[str, Dict[str, float]] = {
 def _get_th(symbol: str) -> Dict[str, float]:
     return CHECKLIST_THRESHOLDS.get(symbol, CHECKLIST_THRESHOLDS["BTCUSDT"])
 
+
+def is_1m_calm(df1m, atr15: float, th: Dict[str, Any]) -> bool:
+    """Return True if 1m microstructure is not chaotic.
+
+    Uses last 5 CLOSED 1m candles (excludes current forming candle).
+    Checks:
+    - optional 1m VOLx cap (volx1_max)
+    - avg wick/body ratio cap (wick_body_max)
+    - 1m range over last 5 vs ATR(15m) cap (range1m_atr15_max)
+    """
+    try:
+        if df1m is None or len(df1m) < 10:
+            return True
+        if not _valid(atr15) or atr15 <= 0:
+            return True
+
+        wick_body_max = float(th.get("wick_body_max", 2.2))
+        range1m_atr15_max = float(th.get("range1m_atr15_max", 0.40))
+        volx1_max = float(th.get("volx1_max", 2.0))
+
+        recent = df1m.iloc[-6:-1].copy()  # last 5 closed 1m candles
+
+        # Volume spike gate (optional)
+        if "vol_sma20" in recent.columns and "volume" in recent.columns:
+            v1 = safe_float(recent["volume"].iloc[-1])
+            v1a = safe_float(recent["vol_sma20"].iloc[-1])
+            volx1 = (v1 / v1a) if (_valid(v1, v1a) and v1a > 0) else 0.0
+            if volx1_max > 0 and volx1 > volx1_max:
+                return False
+
+        # Wick-to-body ratio
+        body = (recent["close"] - recent["open"]).abs().clip(lower=1e-9)
+        rng = (recent["high"] - recent["low"]).clip(lower=0.0)
+        wick = (rng - body).clip(lower=0.0)
+        avg_wick_body = float((wick / body).mean())
+        if avg_wick_body > wick_body_max:
+            return False
+
+        # Range over last 5 closed 1m candles relative to 15m ATR
+        range_1m = float(recent["high"].max() - recent["low"].min())
+        if (range_1m / atr15) > range1m_atr15_max:
+            return False
+
+        return True
+    except Exception:
+        return True
+
 def _reclaim_ok(px: Optional[float], ema20: Optional[float], vwap: Optional[float], mode: str) -> bool:
     if not _valid(px):
         return False
@@ -123,8 +170,12 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
         volx1 = (v1 / v1a) if (_valid(v1, v1a) and v1a > 0) else 0.0
 
     # 1) Trend OK (HTF alignment)
-    htf_long, htf_short, _ = check_htf_alignment(df1h, df4h)
+    htf_long, htf_short, htf_ctx = check_htf_alignment(df1h, df4h)
     trend_ok = htf_long if direction == "LONG" else htf_short
+
+
+    # HTF regime score (0-10) — finer context used for adaptive RR & filters
+    htf_regime = compute_htf_regime_score(htf_ctx, direction)
 
     # 2) Reclaim EMA/VWAP
     reclaim_ok = _reclaim_ok(px, ema20, vwap, str(th.get("reclaim_mode", "OR")))
@@ -214,21 +265,18 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
     diff = abs(long_s - short_s)
     grade_ok = (qscore >= float(th.get("grade_a_min", 60.0))) and (diff >= MIN_SCORE_DIFF)
 
+    # Order flow veto (optional): if signal provides aggressor data and it's strongly against direction, veto entry
+    of_veto = False
+    if isinstance(signal, dict):
+        aggr_buy = float(signal.get('aggr_buy', signal.get('aggr_buy_pct', 50.0)) or 50.0)
+        # For LONG: very low aggr_buy implies sellers dominant. For SHORT: very high aggr_buy implies buyers dominant.
+        if direction == 'LONG' and aggr_buy <= float(th.get('flow_veto_long_aggr_max', 30.0)):
+            of_veto = True
+        if direction == 'SHORT' and aggr_buy >= float(th.get('flow_veto_short_aggr_min', 70.0)):
+            of_veto = True
+
     # 10) Calm / no spike (1m)
-    volx1_max = float(th.get("volx1_max", 2.0))
-    wick_body_max = float(th.get("wick_body_max", 2.2))
-    range1m_atr15_max = float(th.get("range1m_atr15_max", 0.40))
-    calm_ok = (volx1 <= volx1_max)
-    try:
-        if df1m is not None and len(df1m) >= 6 and _valid(atr) and atr > 0:
-            last = df1m.tail(5).copy()
-            body = (last['close'] - last['open']).abs().clip(lower=1e-9)
-            wick = (last['high'] - last['low'] - body).clip(lower=0.0)
-            wick_ratio = float((wick / body).mean())
-            last_range = float((last['high'] - last['low']).iloc[-1])
-            calm_ok = calm_ok and (wick_ratio <= wick_body_max) and (last_range <= range1m_atr15_max * atr)
-    except Exception:
-        pass
+    calm_ok = is_1m_calm(df1, atr, th)
 
     items = [
         ("Trend OK", trend_ok),
@@ -243,8 +291,8 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
         ("Calm (1m)", calm_ok),
     ]
     yes = sum(1 for _, v in items if v)
-    gate = "VALID ENTRY" if yes == 10 else "NO TRADE"
-    return {"items": items, "yes": yes, "no": 10 - yes, "gate": gate, "volx15": volx15, "volx1": volx1}
+    gate = "VALID ENTRY" if (yes == 10 and not of_veto) else "NO TRADE"
+    return {"items": items, "yes": yes, "no": 10 - yes, "gate": gate, "volx15": volx15, "volx1": volx1, "htf_regime": htf_regime, "of_veto": of_veto}
 
 def format_checklist_block(check: Dict[str, Any], symbol: str = "") -> str:
     if not check or not check.get("items"):
