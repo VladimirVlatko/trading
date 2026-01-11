@@ -35,6 +35,7 @@ CHECKLIST_THRESHOLDS: Dict[str, Dict[str, float]] = {
     "BTCUSDT": {
         "volx15_min": 0.80, "volx15_max": 1.40,
         "volx1_max": 2.00,
+        "wick_body_max": 2.00, "range1m_atr15_max": 0.35,
         "rsi_long_min": 51.0, "rsi_short_max": 49.0,
         "reclaim_mode": "AND",   # EMA20 AND VWAP
         "absorb_lookback": 5, "absorb_buf_atr": 0.05,
@@ -47,6 +48,7 @@ CHECKLIST_THRESHOLDS: Dict[str, Dict[str, float]] = {
     "ETHUSDT": {
         "volx15_min": 0.85, "volx15_max": 1.60,
         "volx1_max": 2.20,
+        "wick_body_max": 2.20, "range1m_atr15_max": 0.40,
         "rsi_long_min": 50.0, "rsi_short_max": 50.0,
         "reclaim_mode": "EMA",   # EMA20 only (VWAP optional)
         "absorb_lookback": 5, "absorb_buf_atr": 0.06,
@@ -59,6 +61,7 @@ CHECKLIST_THRESHOLDS: Dict[str, Dict[str, float]] = {
     "SOLUSDT": {
         "volx15_min": 0.90, "volx15_max": 1.90,
         "volx1_max": 2.80,
+        "wick_body_max": 2.20, "range1m_atr15_max": 0.45,
         "rsi_long_min": 50.0, "rsi_short_max": 50.0,
         "reclaim_mode": "OR",    # EMA20 OR VWAP
         "absorb_lookback": 6, "absorb_buf_atr": 0.10,
@@ -181,7 +184,14 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
 
     # 8) RR >= rr_min (target: nearest of VWAP/EMA50 in direction)
     rr_ok = False
-    rr_min = float(th.get("rr_min", 1.5))
+    base_rr_min = float(th.get("rr_min", 1.5))
+    # Adaptive RR minimum based on HTF regime (chop -> require bigger RR)
+    if htf_regime <= 4:
+        rr_min = max(base_rr_min, 2.00)
+    elif htf_regime <= 7:
+        rr_min = max(base_rr_min, base_rr_min + 0.20)
+    else:
+        rr_min = base_rr_min
     if sl_ok and _valid(sl_dist) and sl_dist > 0:
         targets = []
         if direction == "LONG":
@@ -205,7 +215,20 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
     grade_ok = (qscore >= float(th.get("grade_a_min", 60.0))) and (diff >= MIN_SCORE_DIFF)
 
     # 10) Calm / no spike (1m)
-    calm_ok = (volx1 <= float(th.get("volx1_max", 2.0)))
+    volx1_max = float(th.get("volx1_max", 2.0))
+    wick_body_max = float(th.get("wick_body_max", 2.2))
+    range1m_atr15_max = float(th.get("range1m_atr15_max", 0.40))
+    calm_ok = (volx1 <= volx1_max)
+    try:
+        if df1m is not None and len(df1m) >= 6 and _valid(atr) and atr > 0:
+            last = df1m.tail(5).copy()
+            body = (last['close'] - last['open']).abs().clip(lower=1e-9)
+            wick = (last['high'] - last['low'] - body).clip(lower=0.0)
+            wick_ratio = float((wick / body).mean())
+            last_range = float((last['high'] - last['low']).iloc[-1])
+            calm_ok = calm_ok and (wick_ratio <= wick_body_max) and (last_range <= range1m_atr15_max * atr)
+    except Exception:
+        pass
 
     items = [
         ("Trend OK", trend_ok),
@@ -301,6 +324,14 @@ MAX_DIST_VWAP_ATR = 1.0       # Was 0.6 → now 1.0 (flexible)
 # === Order Flow Analysis (15m based) ===
 AGGRESSOR_BUY_RATIO_MIN = 0.60   # Was 0.65 → now 0.60 (60%+)
 AGGRESSOR_SELL_RATIO_MAX = 0.40  # Sellers dominate when aggr_buy <= 40%
+
+
+# === Order Flow Override (safety) ===
+# If order-flow is strongly AGAINST the proposed direction, cap the total score to avoid "pretty chart, bad tape".
+FLOW_OVERRIDE_ENABLED = True
+FLOW_OVERRIDE_LONG_AGGR_MAX = 0.35   # <= 35% aggrBuy is hostile for LONG
+FLOW_OVERRIDE_SHORT_AGGR_MIN = 0.65  # >= 65% aggrBuy is hostile for SHORT (i.e., sellers not in control)
+FLOW_OVERRIDE_SCORE_CAP = 69         # cap score to keep it below ENTRY thresholds
 
 # === Quality Score System (100 points total) ===
 # All points from 15m + HTF ONLY
@@ -659,6 +690,68 @@ def check_htf_alignment(df1h: pd.DataFrame, df4h: pd.DataFrame) -> Tuple[bool, b
     return htf_long_ok, htf_short_ok, context
 
 
+
+# ============================================================
+# HTF Regime Score (0-10) — granular context, not just YES/NO
+# ============================================================
+def compute_htf_regime_score(htf_ctx: Dict[str, Any], direction: str) -> int:
+    """Return HTF regime score 0–10 for the given direction.
+    - 9–10: strong trend (both TFs aligned + strong stack)
+    - 6–8 : aligned but weaker / late trend
+    - 3–5 : mixed / transition
+    - 0–2 : chop / hostile for this direction
+    """
+    try:
+        above_1h = bool(htf_ctx.get("1h_above_200"))
+        above_4h = bool(htf_ctx.get("4h_above_200"))
+        s1 = str(htf_ctx.get("1h_strength", "WEAK")).upper()
+        s4 = str(htf_ctx.get("4h_strength", "WEAK")).upper()
+
+        bull_stack_1h = bool(htf_ctx.get("1h_stack_bull"))
+        bull_stack_4h = bool(htf_ctx.get("4h_stack_bull"))
+        bear_stack_1h = bool(htf_ctx.get("1h_stack_bear"))
+        bear_stack_4h = bool(htf_ctx.get("4h_stack_bear"))
+
+        aligned_bull = above_1h and above_4h
+        aligned_bear = (not above_1h) and (not above_4h)
+        mixed = (above_1h != above_4h)
+
+        # Base score by regime
+        if direction == "LONG":
+            if aligned_bull:
+                score = 6
+                score += 2 if s4 == "STRONG" else 0
+                score += 1 if s1 == "STRONG" else 0
+                score += 1 if (bull_stack_1h and bull_stack_4h) else 0
+                return int(min(10, max(0, score)))
+            if mixed:
+                # transition: 4h up but 1h below is worse than 1h up but 4h below
+                score = 4 if above_4h else 3
+                score += 1 if s4 == "STRONG" else 0
+                return int(min(5, max(0, score)))
+            # aligned bear (hostile for long)
+            score = 2
+            score -= 1 if (bear_stack_1h and bear_stack_4h) else 0
+            return int(min(2, max(0, score)))
+
+        # SHORT
+        if aligned_bear:
+            score = 6
+            score += 2 if s4 == "STRONG" else 0
+            score += 1 if s1 == "STRONG" else 0
+            score += 1 if (bear_stack_1h and bear_stack_4h) else 0
+            return int(min(10, max(0, score)))
+        if mixed:
+            score = 4 if (not above_4h) else 3
+            score += 1 if s4 == "STRONG" else 0
+            return int(min(5, max(0, score)))
+        # aligned bull (hostile for short)
+        score = 2
+        score -= 1 if (bull_stack_1h and bull_stack_4h) else 0
+        return int(min(2, max(0, score)))
+    except Exception:
+        return 0
+
 # ============================================================
 # MTF Bonus Check (5m vs 15m alignment - OPTIONAL bonus)
 # ============================================================
@@ -720,6 +813,8 @@ def calculate_quality_score_v3(
 
     # === 1. HTF Alignment (20 points) ===
     htf_long, htf_short, htf_ctx = check_htf_alignment(df1h, df4h)
+    htf_regime = compute_htf_regime_score(htf_ctx, direction)
+    htf_regime = compute_htf_regime_score(htf_ctx, direction)
 
     if direction == "LONG":
         if htf_long:
@@ -739,6 +834,8 @@ def calculate_quality_score_v3(
                 breakdown["htf"] = 15
 
     breakdown.setdefault("htf", 0)
+    breakdown["htf_regime"] = htf_regime
+
 
     # === 2. 15m Momentum (25 points: RSI 15 + MACD 10) ===
     rsi_15m = safe_float(df15m.loc[i15m, "rsi14"])
@@ -879,6 +976,23 @@ def calculate_quality_score_v3(
     score += flow_score
     breakdown["order_flow"] = flow_score
     breakdown["aggr_ratio_15m"] = aggr_ratio_15m
+
+
+    # --- Order Flow Override (hostile tape -> cap score) ---
+    flow_override = ""
+    if FLOW_OVERRIDE_ENABLED:
+        if direction == "LONG":
+            if _valid(aggr_ratio_15m, delta_cumsum_15m) and (aggr_ratio_15m <= FLOW_OVERRIDE_LONG_AGGR_MAX) and (delta_cumsum_15m < 0):
+                flow_override = "HOSTILE_LONG"
+        elif direction == "SHORT":
+            if _valid(aggr_ratio_15m, delta_cumsum_15m) and (aggr_ratio_15m >= FLOW_OVERRIDE_SHORT_AGGR_MIN) and (delta_cumsum_15m > 0):
+                flow_override = "HOSTILE_SHORT"
+
+    if flow_override:
+        breakdown["flow_override"] = flow_override
+        score = min(score, FLOW_OVERRIDE_SCORE_CAP)
+    else:
+        breakdown["flow_override"] = ""
 
     # === 5. MTF Bonus (10 points - OPTIONAL) ===
     mtf_bonus = check_mtf_bonus(df5m, df15m, direction)
@@ -1069,11 +1183,13 @@ def generate_leverage_report_v3(signal: Dict[str, Any], cache: "MarketCache") ->
         "",
         "📊 QUALITY BREAKDOWN (15m + HTF):",
         f"  HTF Alignment: {breakdown.get('htf', 0)}/20",
+        f"  HTF Regime: {breakdown.get('htf_regime', 0)}/10",
         f"  15m RSI: {breakdown.get('rsi', 0)}/15",
         f"  15m MACD: {breakdown.get('macd', 0)}/10",
         f"  15m Proximity: {breakdown.get('proximity', 0)}/15",
         f"  15m Volume: {breakdown.get('volume', 0)}/10",
         f"  15m Order Flow: {breakdown.get('order_flow', 0)}/20",
+        f"  Flow Override: {breakdown.get('flow_override', '') or '—'}",
         f"  MTF Bonus (5m): {breakdown.get('mtf_bonus', 0)}/10",
         "",
         "🌍 HTF CONTEXT:",
@@ -1242,11 +1358,13 @@ def generate_manual_report_v3(symbol: str, cache: "MarketCache") -> str:
         f"  Close: {snap_1m.get('close', 0):.2f} | RSI: {snap_1m.get('rsi', 0):.1f} | VOLx: {snap_1m.get('volx', 0):.2f}x\n\n"
         f"💡 SCORE BREAKDOWN:\n"
         f"  HTF: {long_q['breakdown'].get('htf', 0)}/20 (L) | {short_q['breakdown'].get('htf', 0)}/20 (S)\n"
+        f"  Regime: {long_q['breakdown'].get('htf_regime', 0)}/10 (L) | {short_q['breakdown'].get('htf_regime', 0)}/10 (S)\n"
         f"  RSI: {long_q['breakdown'].get('rsi', 0)}/15 (L) | {short_q['breakdown'].get('rsi', 0)}/15 (S)\n"
         f"  MACD: {long_q['breakdown'].get('macd', 0)}/10 (L) | {short_q['breakdown'].get('macd', 0)}/10 (S)\n"
         f"  Proximity: {long_q['breakdown'].get('proximity', 0)}/15 (L) | {short_q['breakdown'].get('proximity', 0)}/15 (S)\n"
         f"  Volume: {long_q['breakdown'].get('volume', 0)}/10 (L) | {short_q['breakdown'].get('volume', 0)}/10 (S)\n"
         f"  Flow: {long_q['breakdown'].get('order_flow', 0)}/20 (L) | {short_q['breakdown'].get('order_flow', 0)}/20 (S)\n"
+        f"  Override: {long_q['breakdown'].get('flow_override', '') or '—'} (L) | {short_q['breakdown'].get('flow_override', '') or '—'} (S)\n"
         f"  MTF: {long_q['breakdown'].get('mtf_bonus', 0)}/10 (L) | {short_q['breakdown'].get('mtf_bonus', 0)}/10 (S)\n\n"
         f"{_chk_txt}\n\n"f"{'=' * 60}\n"
         f"🤖 FOR GPT ANALYSIS:\n\n"
