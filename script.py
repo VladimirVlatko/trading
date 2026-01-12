@@ -393,6 +393,31 @@ MIN_SCORE_DIFF = 10  # Winning direction must be 10+ points ahead
 # === Signal Timing ===
 SIGNAL_COOLDOWN_SECONDS = 300  # 5min between same-direction signals
 
+
+# ============================================================
+# MODE 2 (SOL only) — "Continuation / Momentum-lite"
+# Purpose: while waiting for strict MODE 1 (v3) signals, MODE 2 can flag
+# higher-frequency continuation setups on SOL with clearly labeled risk.
+# ============================================================
+MODE2_SOL_ENABLED = True
+
+# MODE 2 thresholds (separate from MODE 1)
+MODE2_SOL_SCORE_WATCH = 52     # "setup watch" (more frequent)
+MODE2_SOL_SCORE_ENTRY = 62     # "entry ok" (still filtered)
+MODE2_SOL_MIN_DIFF = 6         # direction must win by this much
+
+# MODE 2 timing / anti-spam
+MODE2_SOL_SIGNAL_COOLDOWN_SECONDS = 180  # 3min between same-direction MODE2 alerts
+
+# MODE 2 structure filters (15m-based)
+MODE2_SOL_MAX_DIST_EMA20_ATR = 1.2       # allow wider pullbacks than MODE1
+MODE2_SOL_MAX_DIST_VWAP_ATR = 1.8
+MODE2_SOL_MIN_VOLX = 0.70                # allow "normal-ish" volume
+
+# Gate: if MODE1 is close to triggering, don't spam MODE2
+MODE2_SOL_BLOCK_IF_MODE1_MAX_SCORE_GE = 58
+MODE2_SOL_BLOCK_IF_MODE1_DIFF_GE = 8
+
 # === Telegram ===
 MAX_TG_LEN = 3800
 ERROR_NOTIFY_COOLDOWN = 120
@@ -1120,6 +1145,394 @@ def detect_leverage_opportunity_v3(symbol: str, cache: "MarketCache") -> Optiona
     }
 
 
+
+
+# ============================================================
+# MODE 2 (SOL only) — Continuation / Momentum-lite
+# ============================================================
+def calculate_quality_score_mode2_sol(
+    df15m: pd.DataFrame,
+    df5m: pd.DataFrame,
+    df1h: pd.DataFrame,
+    df4h: pd.DataFrame,
+    direction: str
+) -> Dict[str, Any]:
+    """Simplified, higher-frequency scoring for SOL continuation.
+    Uses 15m + HTF (looser than MODE1). 5m is used only as a light confirmation.
+    """
+    score = 0
+    breakdown: Dict[str, Any] = {}
+
+    i15m = len(df15m) - 2
+    if i15m < 30:
+        return {"score": 0, "breakdown": {}, "error": "insufficient_data", "htf_context": {}}
+
+    # Core values
+    px = safe_float(df15m.loc[i15m, "close"])
+    px_prev = safe_float(df15m.loc[i15m - 1, "close"])
+    ema20 = safe_float(df15m.loc[i15m, "ema20"])
+    ema20_prev = safe_float(df15m.loc[i15m - 1, "ema20"])
+    vwap = safe_float(df15m.loc[i15m, "vwap"])
+    atr = safe_float(df15m.loc[i15m, "atr14"]) or 0.0
+    rsi = safe_float(df15m.loc[i15m, "rsi14"])
+    macdh = safe_float(df15m.loc[i15m, "macdh"])
+    macdh_prev = safe_float(df15m.loc[i15m - 1, "macdh"])
+
+    vol = safe_float(df15m.loc[i15m, "volume"])
+    vol_sma = safe_float(df15m.loc[i15m, "vol_sma20"])
+    volx = (vol / vol_sma) if (_valid(vol, vol_sma) and vol_sma and vol_sma > 0) else 0.0
+
+    aggr = safe_float(df15m.loc[i15m, "aggressor_buy_ratio"])
+
+    # === 1) HTF context (max 15) — looser than MODE1
+    htf_long, htf_short, htf_ctx = check_htf_alignment(df1h, df4h)
+    breakdown["htf_context"] = htf_ctx
+
+    if direction == "LONG":
+        if htf_long:
+            score += 15
+            breakdown["htf"] = 15
+        elif htf_ctx.get("1h_above_ema200") or htf_ctx.get("4h_above_ema200"):
+            score += 10
+            breakdown["htf"] = 10
+        else:
+            breakdown["htf"] = 0
+    else:
+        if htf_short:
+            score += 15
+            breakdown["htf"] = 15
+        elif htf_ctx.get("1h_below_ema200") or htf_ctx.get("4h_below_ema200"):
+            score += 10
+            breakdown["htf"] = 10
+        else:
+            breakdown["htf"] = 0
+
+    # === 2) Continuation structure (max 20)
+    structure = 0
+    if atr and atr > 0:
+        dist_ema20_atr = abs(px - ema20) / atr if _valid(px, ema20) else 9.9
+        dist_vwap_atr = abs(px - vwap) / atr if _valid(px, vwap) else 9.9
+    else:
+        dist_ema20_atr = 9.9
+        dist_vwap_atr = 9.9
+
+    # Anti-chase filter:
+    # If price is "too far in the air" from the key mean (EMA20 / VWAP),
+    # MODE2 should NOT even WATCH. This prevents late-chase continuation alerts.
+    # (Uses ATR-normalized distances for scale-invariance.)
+    if _valid(dist_ema20_atr) and dist_ema20_atr > MODE2_SOL_MAX_DIST_EMA20_ATR:
+        breakdown["blocked_reason"] = "ANTI_CHASE"
+        breakdown["blocked_detail"] = f"dist_ema20_atr {dist_ema20_atr:.2f} > {MODE2_SOL_MAX_DIST_EMA20_ATR:.2f}"
+        breakdown["dist_ema20_atr"] = float(dist_ema20_atr)
+        breakdown["dist_vwap_atr"] = float(dist_vwap_atr)
+        return {
+            "score": 0,
+            "breakdown": breakdown,
+            "checklist": {"pass": False, "reason": "ANTI_CHASE: too far from EMA20"},
+        }
+
+    if _valid(dist_vwap_atr) and dist_vwap_atr > MODE2_SOL_MAX_DIST_VWAP_ATR:
+        breakdown["blocked_reason"] = "ANTI_CHASE"
+        breakdown["blocked_detail"] = f"dist_vwap_atr {dist_vwap_atr:.2f} > {MODE2_SOL_MAX_DIST_VWAP_ATR:.2f}"
+        breakdown["dist_ema20_atr"] = float(dist_ema20_atr)
+        breakdown["dist_vwap_atr"] = float(dist_vwap_atr)
+        return {
+            "score": 0,
+            "breakdown": breakdown,
+            "checklist": {"pass": False, "reason": "ANTI_CHASE: too far from VWAP"},
+        }
+
+    reclaim_long = (_valid(px_prev, ema20_prev, px, ema20) and px_prev < ema20_prev and px > ema20)
+    reclaim_short = (_valid(px_prev, ema20_prev, px, ema20) and px_prev > ema20_prev and px < ema20)
+
+    if direction == "LONG":
+        if _valid(px, ema20) and (px >= ema20 or reclaim_long):
+            structure += 10
+        if dist_ema20_atr <= MODE2_SOL_MAX_DIST_EMA20_ATR:
+            structure += 6
+        if dist_vwap_atr <= MODE2_SOL_MAX_DIST_VWAP_ATR:
+            structure += 4
+    else:
+        if _valid(px, ema20) and (px <= ema20 or reclaim_short):
+            structure += 10
+        if dist_ema20_atr <= MODE2_SOL_MAX_DIST_EMA20_ATR:
+            structure += 6
+        if dist_vwap_atr <= MODE2_SOL_MAX_DIST_VWAP_ATR:
+            structure += 4
+
+    score += structure
+    breakdown["structure"] = structure
+    breakdown["dist_ema20_atr"] = float(dist_ema20_atr)
+    breakdown["dist_vwap_atr"] = float(dist_vwap_atr)
+
+    # === 3) Momentum (RSI) (max 15)
+    rsi_score = 0
+    if _valid(rsi):
+        if direction == "LONG":
+            if rsi >= 55:
+                rsi_score = 15
+            elif rsi >= 48:
+                rsi_score = 10
+            elif rsi >= 44:
+                rsi_score = 5
+        else:
+            if rsi <= 45:
+                rsi_score = 15
+            elif rsi <= 52:
+                rsi_score = 10
+            elif rsi <= 56:
+                rsi_score = 5
+    score += rsi_score
+    breakdown["rsi"] = rsi_score
+    breakdown["rsi14"] = float(rsi) if _valid(rsi) else None
+
+    # === 4) MACD histogram direction (max 10)
+    macd_score = 0
+    if _valid(macdh, macdh_prev):
+        slope = macdh - macdh_prev
+        if direction == "LONG":
+            if macdh > 0 and slope > 0:
+                macd_score = 10
+            elif slope > 0:
+                macd_score = 6
+            elif macdh > 0:
+                macd_score = 4
+        else:
+            if macdh < 0 and slope < 0:
+                macd_score = 10
+            elif slope < 0:
+                macd_score = 6
+            elif macdh < 0:
+                macd_score = 4
+    score += macd_score
+    breakdown["macd"] = macd_score
+
+    # === 5) Volume (max 10)
+    vol_score = 0
+    if volx >= 1.10:
+        vol_score = 10
+    elif volx >= MODE2_SOL_MIN_VOLX:
+        vol_score = 6
+    score += vol_score
+    breakdown["volume"] = vol_score
+    breakdown["volx15m"] = float(volx)
+
+    # === 6) Tape / order-flow (max 10) — light filter
+    flow_score = 0
+    if _valid(aggr):
+        if direction == "LONG":
+            if aggr >= 0.58:
+                flow_score = 10
+            elif aggr >= 0.53:
+                flow_score = 6
+        else:
+            if aggr <= 0.42:
+                flow_score = 10
+            elif aggr <= 0.47:
+                flow_score = 6
+    score += flow_score
+    breakdown["order_flow"] = flow_score
+    breakdown["aggr_buy_ratio"] = float(aggr) if _valid(aggr) else None
+
+    # === 7) 5m hint (max 5) — only if available
+    mtf = 0
+    try:
+        i5 = len(df5m) - 2
+        if i5 >= 25:
+            rsi5 = safe_float(df5m.loc[i5, "rsi14"])
+            ema20_5 = safe_float(df5m.loc[i5, "ema20"])
+            px5 = safe_float(df5m.loc[i5, "close"])
+            if direction == "LONG":
+                if _valid(px5, ema20_5) and px5 >= ema20_5 and _valid(rsi5) and rsi5 >= 50:
+                    mtf = 5
+            else:
+                if _valid(px5, ema20_5) and px5 <= ema20_5 and _valid(rsi5) and rsi5 <= 50:
+                    mtf = 5
+    except Exception:
+        mtf = 0
+
+    score += mtf
+    breakdown["mtf_hint"] = mtf
+
+    return {
+        "score": int(score),
+        "breakdown": breakdown,
+        "htf_context": htf_ctx,
+    }
+
+
+def mode1_gate_snapshot(symbol: str, cache: "MarketCache") -> Dict[str, Any]:
+    """Lightweight snapshot to decide if MODE2 should be blocked.
+    Computes MODE1 long/short scores without requiring a MODE1 signal.
+    """
+    df15m = cache.get(symbol, "15m")
+    df5m = cache.get(symbol, "5m")
+    df1h = cache.get(symbol, "1h")
+    df4h = cache.get(symbol, "4h")
+    try:
+        long_q = calculate_quality_score_v3(symbol, df15m, df5m, df1h, df4h, "LONG")
+        short_q = calculate_quality_score_v3(symbol, df15m, df5m, df1h, df4h, "SHORT")
+        L = int(long_q.get("score", 0))
+        S = int(short_q.get("score", 0))
+        mx = max(L, S)
+        diff = abs(L - S)
+        return {"L": L, "S": S, "max": mx, "diff": diff}
+    except Exception:
+        return {"L": 0, "S": 0, "max": 0, "diff": 0}
+
+
+def detect_mode2_sol(symbol: str, cache: "MarketCache") -> Optional[Dict[str, Any]]:
+    """MODE2 detector — ONLY for SOLUSDT."""
+    if symbol != "SOLUSDT" or not MODE2_SOL_ENABLED:
+        return None
+
+    df15m = cache.get(symbol, "15m")
+    df5m = cache.get(symbol, "5m")
+    df1h = cache.get(symbol, "1h")
+    df4h = cache.get(symbol, "4h")
+
+    i15m = len(df15m) - 2
+    if i15m < 30:
+        return None
+
+    # Gate: if MODE1 is close, don't fire MODE2
+    gate = mode1_gate_snapshot(symbol, cache)
+    if gate["max"] >= MODE2_SOL_BLOCK_IF_MODE1_MAX_SCORE_GE and gate["diff"] >= MODE2_SOL_BLOCK_IF_MODE1_DIFF_GE:
+        return None
+
+    long_q = calculate_quality_score_mode2_sol(df15m, df5m, df1h, df4h, "LONG")
+    short_q = calculate_quality_score_mode2_sol(df15m, df5m, df1h, df4h, "SHORT")
+
+    L = int(long_q.get("score", 0))
+    S = int(short_q.get("score", 0))
+
+    if L >= MODE2_SOL_SCORE_WATCH and L > S + MODE2_SOL_MIN_DIFF:
+        direction = "LONG"
+        q = long_q
+        score = L
+    elif S >= MODE2_SOL_SCORE_WATCH and S > L + MODE2_SOL_MIN_DIFF:
+        direction = "SHORT"
+        q = short_q
+        score = S
+    else:
+        return None
+
+    if score >= MODE2_SOL_SCORE_ENTRY:
+        level = "MODE2_ENTRY_OK"
+    else:
+        level = "MODE2_WATCH"
+
+    px = safe_float(df15m.loc[i15m, "close"])
+
+    prem = fetch_premium_index(symbol)
+    mark = safe_float(prem.get("markPrice")) or px
+
+    candle_ts_15m = int(df15m.loc[i15m, "ts"])
+
+    return {
+        "mode": "MODE2",
+        "symbol": symbol,
+        "direction": direction,
+        "signal_level": level,
+        "quality_score": int(score),
+        "quality_breakdown": q.get("breakdown", {}),
+        "htf_context": q.get("htf_context", {}),
+        "long_score": L,
+        "short_score": S,
+        "price": px,
+        "mark_price": mark,
+        "premium_index": prem,
+        "candle_ts_15m": candle_ts_15m,
+        "timestamp": time.time(),
+    }
+
+
+def generate_mode2_report_sol(signal: Dict[str, Any], cache: "MarketCache") -> str:
+    """Compact MODE2 report with simple SL/TP ideas (ATR-based)."""
+    symbol = signal["symbol"]
+    direction = signal["direction"]
+    level = signal["signal_level"]
+    score = signal["quality_score"]
+
+    df15m = cache.get(symbol, "15m")
+    i15m = len(df15m) - 2
+
+    px = safe_float(df15m.loc[i15m, "close"])
+    ema20 = safe_float(df15m.loc[i15m, "ema20"])
+    atr = safe_float(df15m.loc[i15m, "atr14"]) or 0.0
+
+    # Simple risk template
+    if atr and atr > 0 and _valid(px, ema20):
+        if direction == "LONG":
+            sl = min(ema20, px) - 1.05 * atr
+            tp1 = px + 1.2 * atr
+            tp2 = px + 2.0 * atr
+        else:
+            sl = max(ema20, px) + 1.05 * atr
+            tp1 = px - 1.2 * atr
+            tp2 = px - 2.0 * atr
+    else:
+        sl = tp1 = tp2 = None
+
+    lev = 3 if score >= MODE2_SOL_SCORE_ENTRY else 2
+
+    b = signal.get("quality_breakdown", {})
+
+    # Explain WATCH vs ENTRY_OK (MODE2)
+    if level == "MODE2_WATCH":
+        reason_lines = [f"❗WATCH (not ENTRY_OK): need score ≥ {MODE2_SOL_SCORE_ENTRY}."]
+        comp_max = {"htf": 15, "structure": 15, "rsi": 15, "macd": 10, "volume": 10, "order_flow": 20, "mtf_hint": 10}
+        weak = []
+        for k, mx in comp_max.items():
+            v = b.get(k, None)
+            if isinstance(v, (int, float)) and mx > 0 and v < 0.5 * mx:
+                weak.append((k, v, mx))
+        if weak:
+            pretty = {
+                "htf": "HTF alignment",
+                "structure": "Structure/EMA hold",
+                "rsi": "RSI quality",
+                "macd": "MACD momentum",
+                "volume": "Volume health",
+                "order_flow": "Order-flow",
+                "mtf_hint": "5m confirmation",
+            }
+            reason_lines.append("Weak components:")
+            for k, v, mx in weak[:4]:
+                reason_lines.append(f"  - {pretty.get(k, k)}: {v:.0f}/{mx}")
+        # Inject reasons near top of message
+        # We'll append these just after the header lines later (see below)
+        signal["_mode2_reasons"] = reason_lines
+    else:
+        signal["_mode2_reasons"] = ["✅ ENTRY_OK: score and conditions satisfied for MODE2."]
+    dist_e = b.get("dist_ema20_atr", None)
+    dist_v = b.get("dist_vwap_atr", None)
+    volx = b.get("volx15m", None)
+    rsi = b.get("rsi14", None)
+    aggr = b.get("aggr_buy_ratio", None)
+
+    lines = []
+    lines.append(f"🟣 MODE 2 | {symbol} {direction} | {level}")
+    lines.append(f"UTC: {utc_now_str()}")
+    lines.append(f"Score: {score} (L {signal['long_score']} | S {signal['short_score']}) | Suggested lev: {lev}x")
+    for _rl in signal.get("_mode2_reasons", []):
+        lines.append(_rl)
+    lines.append("")
+    lines.append(f"15m close: {px:.2f} | EMA20: {ema20:.2f} | ATR14: {atr:.2f}")
+    if dist_e is not None and dist_v is not None:
+        lines.append(f"DistATR: EMA20 {float(dist_e):.2f} | VWAP {float(dist_v):.2f} | VOLx {float(volx or 0):.2f}")
+    if rsi is not None:
+        lines.append(f"RSI14: {float(rsi):.1f} | AggressorBuy: {float(aggr or 0)*100:.1f}%")
+    lines.append("")
+    if sl is not None:
+        lines.append("🎯 Risk template (idea, not advice):")
+        lines.append(f"  SL: {sl:.2f}")
+        lines.append(f"  TP1: {tp1:.2f} | TP2: {tp2:.2f}")
+    else:
+        lines.append("🎯 Risk template: N/A (missing ATR/EMA)")
+    lines.append("")
+    lines.append("Note: MODE2 is *less strict* than MODE1. Prefer MODE1 when it triggers.")
+    return "\n".join(lines)[:MAX_TG_LEN]
 # ============================================================
 # Info Display Functions (5m/1m snapshot - NOT used for scoring)
 # ============================================================
@@ -1732,6 +2145,7 @@ def main():
     cache = MarketCache()
 
     signal_history = {s: SignalHistory() for s in SYMBOLS}
+    mode2_history_sol = SignalHistory()  # MODE2 cooldown state (SOL only)
 
     health = {
         "last_scan_utc": None,
@@ -1839,7 +2253,8 @@ def main():
                             f"Last scan: {health['last_scan_utc'] or 'N/A'}\n"
                             f"Last signal: {health['last_signal_utc'] or 'N/A'}\n"
                             f"Next 15m close: {next_15m} (ETA {int(eta_15m)}s)\n"
-                            f"Scan mode: 15m-only (5m/1m info only)"
+                            f"Scan mode: 15m-only (5m/1m info only)\n"
+                            f"MODE2 SOL: {'ON' if MODE2_SOL_ENABLED else 'OFF'} (watch≥{MODE2_SOL_SCORE_WATCH}, entry≥{MODE2_SOL_SCORE_ENTRY})"
                         )
 
             # 2) Market scanning (15M ONLY)
@@ -1876,6 +2291,36 @@ def main():
                             )
                             health["signals_sent"] += 1
 
+                    # MODE2 (SOL only) — only if MODE1 didn't trigger
+                    elif symbol == "SOLUSDT" and MODE2_SOL_ENABLED:
+                        m2 = detect_mode2_sol(symbol, cache)
+                        if m2:
+                            now = time.time()
+
+                            # custom cooldown for MODE2
+                            allow = False
+                            if mode2_history_sol.last_signal_time == 0:
+                                allow = True
+                            elif m2["direction"] != mode2_history_sol.last_direction:
+                                allow = True
+                            else:
+                                # escalate WATCH -> ENTRY_OK immediately
+                                if mode2_history_sol.last_level == "MODE2_WATCH" and m2["signal_level"] == "MODE2_ENTRY_OK":
+                                    allow = True
+                                elif (now - mode2_history_sol.last_signal_time) >= MODE2_SOL_SIGNAL_COOLDOWN_SECONDS:
+                                    allow = True
+
+                            if allow:
+                                tg_send_message(generate_mode2_report_sol(m2, cache))
+                                mode2_history_sol.update(m2["direction"], m2["signal_level"], now)
+
+                                health["last_signal_utc"] = utc_now_str()
+                                health["last_signal_text"] = (
+                                    f"{symbol} {m2['direction']} {m2['signal_level']} "
+                                    f"(MODE2 score: {m2['quality_score']}, "
+                                    f"L:{m2['long_score']} vs S:{m2['short_score']})"
+                                )
+                                health["signals_sent"] += 1
             health["last_scan_utc"] = utc_now_str()
             health["scan_count"] += 1
 
