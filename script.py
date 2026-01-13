@@ -59,16 +59,16 @@ CHECKLIST_THRESHOLDS: Dict[str, Dict[str, float]] = {
     },
     # SOL: hotter coin, allow more noise but control spikes
     "SOLUSDT": {
-        "volx15_min": 0.90, "volx15_max": 1.90,
-        "volx1_max": 2.80,
-        "wick_body_max": 2.20, "range1m_atr15_max": 0.45,
-        "rsi_long_min": 50.0, "rsi_short_max": 50.0,
+        "volx15_min": 0.60, "volx15_max": 2.20,
+        "volx1_max": 3.50,
+        "wick_body_max": 2.60, "range1m_atr15_max": 0.55,
+        "rsi_long_min": 48.0, "rsi_short_max": 52.0,
         "reclaim_mode": "OR",    # EMA20 OR VWAP
-        "absorb_lookback": 6, "absorb_buf_atr": 0.10,
-        "rej_dist_max": 1.00,
-        "sl_atr_cap": 1.00,
-        "rr_min": 1.40,
-        "grade_a_min": 60.0, "grade_aplus_min": 75.0,
+        "absorb_lookback": 6, "absorb_buf_atr": 0.08,
+        "rej_dist_max": 1.25,
+        "sl_atr_cap": 1.30,
+        "rr_min": 1.25,
+        "grade_a_min": 58.0, "grade_aplus_min": 72.0,
     },
 }
 
@@ -181,7 +181,7 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
     reclaim_ok = _reclaim_ok(px, ema20, vwap, str(th.get("reclaim_mode", "OR")))
 
     # 3) Healthy VOLx (15m)
-    vol_ok = (volx15 >= th["volx15_min"]) and (volx15 <= th["volx15_max"])
+    vol_ok = ((volx15 >= th["volx15_min"]) and (volx15 <= th["volx15_max"])) or (htf_regime >= 8 and volx15 >= 0.35)
 
     # 4) RSI supports
     if direction == "LONG":
@@ -291,7 +291,13 @@ def compute_10s_checklist(symbol: str, direction: str, cache: "MarketCache", sig
         ("Calm (1m)", calm_ok),
     ]
     yes = sum(1 for _, v in items if v)
-    gate = "VALID ENTRY" if (yes == 10 and not of_veto) else "NO TRADE"
+        # --- Relaxed gate: allow more candidates, keep core safety ---
+    core_ok = bool(trend_ok and reclaim_ok and rsi_ok and grade_ok and (not of_veto))
+    # Count YES excluding the last item (Calm) so 1m noise doesn't block good trend days
+    yes_non_calm = sum(1 for (name, v) in items[:-1] if v)
+
+    # Require a clear SL, but allow VOL/RR to be looser in strong HTF regimes
+    gate = "VALID ENTRY" if (core_ok and sl_ok and (yes_non_calm >= 7)) else "NO TRADE"
     return {"items": items, "yes": yes, "no": 10 - yes, "gate": gate, "volx15": volx15, "volx1": volx1, "htf_regime": htf_regime, "of_veto": of_veto}
 
 def format_checklist_block(check: Dict[str, Any], symbol: str = "") -> str:
@@ -340,9 +346,9 @@ MTF_BONUS_POINTS = 10    # Bonus if 5m aligns with 15m
 
 # === Volume Requirements (REALISTIC) ===
 # 15m volume thresholds (main scoring)
-VOL_WATCH_MIN_15M = 1.2    # Was 1.8 → now 1.2 (more realistic)
-VOL_ENTRY_MIN_15M = 1.5    # Was 2.5 → now 1.5 (achievable)
-VOL_PERFECT_MIN_15M = 2.0  # Was 2.5 → now 2.0 (rare but possible)
+VOL_WATCH_MIN_15M = 0.9    # Was 1.8 → now 1.2 (more realistic)
+VOL_ENTRY_MIN_15M = 1.2    # Was 2.5 → now 1.5 (achievable)
+VOL_PERFECT_MIN_15M = 1.6  # Was 2.5 → now 2.0 (rare but possible)
 
 # 5m/1m volume (INFO ONLY - not used for scoring)
 VOL_INFO_SPIKE_5M = 1.8    # Just for display
@@ -362,15 +368,15 @@ RSI_SHORT_IDEAL_MIN = 45
 RSI_SHORT_IDEAL_MAX = 52
 
 # === MACD Slope (15m only) ===
-MACD_SLOPE_ATR_FACTOR_15M = 0.025  # Was 0.035 → now 0.025 (less strict)
+MACD_SLOPE_ATR_FACTOR_15M = 0.020  # Was 0.035 → now 0.025 (less strict)
 
 # === Distance to Key Levels (15m based, RELAXED) ===
-MAX_DIST_EMA20_ATR = 0.8      # Was 0.4 → now 0.8 (more practical)
+MAX_DIST_EMA20_ATR = 1.0      # Was 0.4 → now 0.8 (more practical)
 IDEAL_DIST_EMA20_ATR = 0.3    # Was 0.15 → now 0.3 (achievable)
-MAX_DIST_VWAP_ATR = 1.0       # Was 0.6 → now 1.0 (flexible)
+MAX_DIST_VWAP_ATR = 1.3       # Was 0.6 → now 1.0 (flexible)
 
 # === Order Flow Analysis (15m based) ===
-AGGRESSOR_BUY_RATIO_MIN = 0.60   # Was 0.65 → now 0.60 (60%+)
+AGGRESSOR_BUY_RATIO_MIN = 0.58   # Was 0.65 → now 0.60 (60%+)
 AGGRESSOR_SELL_RATIO_MAX = 0.40  # Sellers dominate when aggr_buy <= 40%
 
 
@@ -383,12 +389,12 @@ FLOW_OVERRIDE_SCORE_CAP = 69         # cap score to keep it below ENTRY threshol
 
 # === Quality Score System (100 points total) ===
 # All points from 15m + HTF ONLY
-QUALITY_SCORE_WATCH = 60     # Minimum score to alert "WATCH"
-QUALITY_SCORE_ENTRY = 75     # Was 80 → now 75 (more achievable)
+QUALITY_SCORE_WATCH = 55     # Minimum score to alert "WATCH"
+QUALITY_SCORE_ENTRY = 70     # Was 80 → now 75 (more achievable)
 QUALITY_SCORE_PERFECT = 90   # Was 95 → now 90 (realistic)
 
 # === Direction Selection ===
-MIN_SCORE_DIFF = 10  # Winning direction must be 10+ points ahead
+MIN_SCORE_DIFF = 8  # Winning direction must be 10+ points ahead
 
 # === Signal Timing ===
 SIGNAL_COOLDOWN_SECONDS = 300  # 5min between same-direction signals
